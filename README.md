@@ -122,3 +122,4 @@ Ordered by leverage, per `docs/REPORT.md` §9:
 3. Assign content to `Wall_Screen_1` and `Wall_Screen_3`.
 4. Port the SATCOM simulation into a testable Rust domain crate.
 5. Migrate binary assets to git-lfs before adding a remote.
+# ruma
