@@ -1,0 +1,30 @@
+# Build output
+/target/
+/frontend/node_modules/
+/frontend/dist/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Script export intermediates — the canonical GLB copies live in
+# frontend/public/assets; anything the Blender scripts drop next to the
+# .blend is a build product.
+/assets/blender/*.glb
+
+# Local-only material (screenshots, reference PDFs, audio demos)
+/scratch/
+*.mp3
+
+# Blender autosave backups — regenerated on every save, never authored
+*.blend1
+
+# Local secrets / OS noise
+.env
+.DS_Store
+
+# Container runtime config — .mcp.json.bak carries a live Hyperia agent token.
+# Never commit these; they are per-container, not per-project.
+.mcp.json
+.mcp.json.bak
+.nemesis8.toml

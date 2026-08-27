@@ -1,0 +1,772 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>SATCOM Ops Floor</title>
+<style>
+  html,body{margin:0;padding:0;overflow:hidden;background:#05070a;height:100%;font-family:'SF Mono','Cascadia Mono',Consolas,'Roboto Mono',monospace;}
+  #app{position:fixed;inset:0;}
+  canvas{display:block;}
+  #hud{position:fixed;inset:0;pointer-events:none;color:#9fd8e8;}
+  #crosshair{position:absolute;left:50%;top:50%;width:5px;height:5px;margin:-2.5px 0 0 -2.5px;border-radius:50%;background:rgba(180,235,255,.85);box-shadow:0 0 6px rgba(120,220,255,.6);}
+  #prompt{position:absolute;left:50%;bottom:14%;transform:translateX(-50%);font-size:13px;letter-spacing:.12em;color:#cfeefb;background:rgba(6,14,22,.72);border:1px solid rgba(90,180,220,.35);padding:8px 16px;border-radius:4px;display:none;}
+  #topbar{position:absolute;top:14px;left:50%;transform:translateX(-50%);font-size:11px;letter-spacing:.28em;color:rgba(160,210,235,.55);}
+  #start{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(3,6,10,.86);backdrop-filter:blur(3px);z-index:10;}
+  #card{max-width:520px;width:88%;border:1px solid rgba(80,170,210,.35);background:#070d14;border-radius:6px;padding:34px 38px;color:#bfe6f4;box-shadow:0 0 60px rgba(20,120,170,.15);}
+  #card .eyebrow{font-size:10px;letter-spacing:.34em;color:#ff9f43;margin-bottom:14px;}
+  #card h1{font-size:24px;font-weight:600;letter-spacing:.08em;margin:0 0 10px;color:#e8f7ff;}
+  #card p{font-size:12.5px;line-height:1.75;color:#8fb9c9;margin:0 0 10px;}
+  #card .keys{font-size:12px;color:#cfeefb;line-height:2;margin:14px 0 20px;border-top:1px solid rgba(80,170,210,.2);border-bottom:1px solid rgba(80,170,210,.2);padding:10px 0;}
+  #card .keys b{color:#7fdcff;font-weight:600;}
+  #enter{pointer-events:auto;cursor:pointer;display:inline-block;font-family:inherit;font-size:13px;letter-spacing:.2em;color:#06131c;background:#5fd0f0;border:0;border-radius:3px;padding:12px 26px;}
+  #enter:hover{background:#8ae2ff;}
+  #vig{position:fixed;inset:0;pointer-events:none;background:radial-gradient(ellipse at center,transparent 62%,rgba(0,0,0,.5) 100%);}
+  #stick,#stickKnob{position:fixed;border-radius:50%;pointer-events:none;display:none;}
+  #stick{width:110px;height:110px;border:1.5px solid rgba(140,210,240,.35);}
+  #stickKnob{width:44px;height:44px;background:rgba(140,210,240,.3);}
+  .touch #stick,.touch #stickKnob{display:block;}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="vig"></div>
+<div id="hud">
+  <div id="topbar">SATCOM OPS · FLOOR 1 · RESTRICTED</div>
+  <div id="crosshair"></div>
+  <div id="prompt"></div>
+  <div id="stick"></div><div id="stickKnob"></div>
+</div>
+<div id="start">
+  <div id="card">
+    <div class="eyebrow">MISSION OPERATIONS CENTER</div>
+    <h1>SATCOM OPS FLOOR</h1>
+    <p>Constellation status wall and live telemetry consoles. All displays update in real time from the onboard simulation.</p>
+    <div class="keys"><b>W A S D</b> move &nbsp;·&nbsp; <b>MOUSE</b> look &nbsp;·&nbsp; <b>SHIFT</b> run<br><b>E</b> inspect / leave a display &nbsp;·&nbsp; <b>M</b> mute hum &nbsp;·&nbsp; <b>ESC</b> release cursor<br><span style="color:#6d93a3">Touch: left side to walk, right side to look.</span></div>
+    <button id="enter">ENTER OPS FLOOR</button>
+  </div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function(){
+"use strict";
+/* ============================== BASICS ============================== */
+var app=document.getElementById('app');
+var renderer=new THREE.WebGLRenderer({antialias:true,powerPreference:'high-performance'});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+renderer.setSize(window.innerWidth,window.innerHeight);
+renderer.shadowMap.enabled=true;
+renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+renderer.outputEncoding=THREE.sRGBEncoding;
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure=1.12;
+app.appendChild(renderer.domElement);
+
+var scene=new THREE.Scene();
+scene.background=new THREE.Color(0xe9ecf0);
+scene.fog=new THREE.Fog(0xe9ecf0,18,48);
+var camera=new THREE.PerspectiveCamera(70,window.innerWidth/window.innerHeight,0.05,80);
+
+var ROOM={w:16,d:11,h:9.9};           // x, z, y
+var HALF_W=ROOM.w/2, HALF_D=ROOM.d/2;
+
+/* ============================== SIMULATION ============================== */
+function clamp(v,a,b){return v<a?a:(v>b?b:v);}
+function rnd(a,b){return a+Math.random()*(b-a);}
+function pad(n){return (n<10?'0':'')+n;}
+function utc(){var d=new Date();return pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())+':'+pad(d.getUTCSeconds())+'Z';}
+function mmss(s){s=Math.max(0,Math.floor(s));return pad(Math.floor(s/60))+':'+pad(s%60);}
+
+var STATIONS=[
+  {name:'WHITE SANDS',lat:32.5,lon:-106.6},
+  {name:'WALLOPS',lat:37.9,lon:-75.5},
+  {name:'KIRUNA',lat:67.9,lon:21.1},
+  {name:'GUAM',lat:13.6,lon:144.9}
+];
+var SATS=[
+  {name:'ASTER-9K', color:'#5fd0f0', incl:53.0, period:5760, lon0:-40,  phase:rnd(0,6.28), geo:false},
+  {name:'MERIDIAN-2',color:'#8affc1', incl:63.4, period:6390, lon0:80,  phase:rnd(0,6.28), geo:false},
+  {name:'RELAY-7',   color:'#ffc46b', incl:0.1,  period:86164,lon0:-101,phase:0, geo:true}
+];
+var SUBS=['POWER','THERMAL','ADCS','COMMS','PAYLD','PROP'];
+var sim={t:0,events:[],ticker:'ALL SYSTEMS NOMINAL — SHIFT B ON CONSOLE'};
+
+SATS.forEach(function(s){
+  s.ebno=rnd(7,10); s.agc=rnd(-52,-46); s.rate=s.geo?450:150; s.snr=rnd(11,15);
+  s.hist={ebno:[],agc:[]};
+  s.subs={}; SUBS.forEach(function(k){s.subs[k]='OK';});
+  s.inPass=false; s.passStation=null; s.aos=rnd(200,900); s.los=0; s.mode='IDLE';
+});
+function pushEvent(sev,txt){
+  sim.events.unshift({t:utc(),sev:sev,txt:txt});
+  if(sim.events.length>80)sim.events.pop();
+  if(sev!=='INFO')sim.ticker=sev+' · '+txt;
+}
+pushEvent('INFO','OPS floor simulation initialized');
+pushEvent('INFO','Ground network handshake complete (4/4 sites)');
+
+function subpoint(s,t){ // t seconds
+  if(s.geo)return {lat:0.05*Math.sin(t/9000),lon:s.lon0};
+  var u=2*Math.PI*(t/s.period)+s.phase;
+  var i=s.incl*Math.PI/180;
+  var lat=Math.asin(Math.sin(i)*Math.sin(u))*180/Math.PI;
+  var lon=Math.atan2(Math.cos(i)*Math.sin(u),Math.cos(u))*180/Math.PI + s.lon0 - (360/86164)*t;
+  lon=((lon+180)%360+360)%360-180;
+  return {lat:lat,lon:lon};
+}
+function gcDeg(a,b){ // rough great-circle separation in degrees
+  var dlat=a.lat-b.lat;
+  var dlon=Math.abs(a.lon-b.lon); if(dlon>180)dlon=360-dlon;
+  dlon*=Math.cos((a.lat+b.lat)*0.5*Math.PI/180);
+  return Math.sqrt(dlat*dlat+dlon*dlon);
+}
+function nearestStation(p){
+  var best=null,bd=1e9;
+  for(var i=0;i<STATIONS.length;i++){var d=gcDeg(p,STATIONS[i]);if(d<bd){bd=d;best=STATIONS[i];}}
+  return {st:best,deg:bd};
+}
+function computeAOS(s){ // sample ahead for next contact
+  if(s.geo)return 0;
+  for(var dt=20;dt<7200;dt+=20){
+    var n=nearestStation(subpoint(s,sim.t+dt));
+    if(n.deg<18)return dt;
+  }
+  return 7200;
+}
+var teleAcc=0, aosAcc=0, faultAcc=0;
+function simTick(dt){
+  sim.t+=dt*14;                      // time-warped orbits so passes actually happen
+  teleAcc+=dt; aosAcc+=dt; faultAcc+=dt;
+  SATS.forEach(function(s){
+    var p=subpoint(s,sim.t), n=nearestStation(p);
+    var was=s.inPass;
+    s.inPass=s.geo?true:(n.deg<18);
+    s.passStation=s.inPass?n.st:null;
+    s.mode=s.geo?'TRACK':(s.inPass?'TRACK':(s.aos<120?'ACQ':'IDLE'));
+    if(s.inPass&&!was){pushEvent('INFO','AOS '+s.name+' @ '+n.st.name);s.los=rnd(300,540);}
+    if(!s.inPass&&was){pushEvent('INFO','LOS '+s.name+' — pass complete');}
+    if(s.inPass)s.los-=dt*14; else s.aos-=dt*14;
+    // telemetry random walk
+    var target=s.inPass? (s.geo?9.5:11.5):4.5;
+    s.ebno+=(target-s.ebno)*dt*0.35+rnd(-.35,.35);
+    s.ebno=clamp(s.ebno,1.5,14.5);
+    s.agc=clamp(s.agc+rnd(-.5,.5)+(s.inPass?0.15:-0.12),-62,-40);
+    s.snr=clamp(s.ebno+rnd(2.5,3.5),4,20);
+    s.rate=s.inPass?(s.geo?450:150):(s.geo?450:2);
+  });
+  if(teleAcc>0.5){teleAcc=0;
+    SATS.forEach(function(s){
+      s.hist.ebno.push(s.ebno); if(s.hist.ebno.length>130)s.hist.ebno.shift();
+      s.hist.agc.push(s.agc);   if(s.hist.agc.length>130)s.hist.agc.shift();
+    });
+  }
+  if(aosAcc>5){aosAcc=0;SATS.forEach(function(s){if(!s.inPass)s.aos=computeAOS(s);});}
+  if(faultAcc>6){faultAcc=0;
+    if(Math.random()<0.5){
+      var s=SATS[(Math.random()*SATS.length)|0], k=SUBS[(Math.random()*SUBS.length)|0];
+      if(s.subs[k]==='OK'&&Math.random()<0.6){
+        s.subs[k]=Math.random()<0.15?'FAULT':'WARN';
+        pushEvent(s.subs[k],s.name+' '+k+' '+(s.subs[k]==='FAULT'?'out of limits':'approaching limit'));
+        (function(sat,key){setTimeout(function(){sat.subs[key]='OK';pushEvent('INFO',sat.name+' '+key+' back in limits');},rnd(9000,22000));})(s,k);
+      }
+    }
+  }
+}
+
+/* ============================== SCREEN CANVASES ============================== */
+var FONT="'SF Mono','Cascadia Mono',Consolas,'Roboto Mono',monospace";
+var screens=[]; // {tex,cv,cx,draw,interval,last,mesh,label}
+function makeScreen(w,h,draw,interval,label){
+  var cv=document.createElement('canvas');cv.width=w;cv.height=h;
+  var cx=cv.getContext('2d');
+  var tex=new THREE.CanvasTexture(cv);
+  tex.encoding=THREE.sRGBEncoding;tex.minFilter=THREE.LinearFilter;tex.generateMipmaps=false;tex.anisotropy=4;
+  var s={tex:tex,cv:cv,cx:cx,draw:draw,interval:interval,last:-1e9,label:label};
+  screens.push(s);return s;
+}
+function panelBG(cx,w,h,title,tag){
+  cx.fillStyle='#040a12';cx.fillRect(0,0,w,h);
+  cx.strokeStyle='rgba(70,150,190,.35)';cx.lineWidth=2;cx.strokeRect(1,1,w-2,h-2);
+  cx.fillStyle='rgba(20,50,72,.55)';cx.fillRect(0,0,w,34);
+  cx.fillStyle='#7fdcff';cx.font='600 15px '+FONT;cx.textBaseline='middle';cx.textAlign='left';
+  cx.fillText(title,14,18);
+  cx.textAlign='right';cx.fillStyle='#ff9f43';cx.font='11px '+FONT;
+  cx.fillText(tag+'  '+utc(),w-12,18);
+  cx.textAlign='left';
+}
+function sevColor(sev){return sev==='FAULT'?'#ff5f56':(sev==='WARN'?'#ffbe45':(sev==='INFO'?'#5aa8c4':'#8affc1'));}
+
+/* ---- wall display: constellation map ---- */
+function drawWall(cx,w,h){
+  cx.fillStyle='#03070d';cx.fillRect(0,0,w,h);
+  // header
+  cx.fillStyle='rgba(18,46,66,.6)';cx.fillRect(0,0,w,58);
+  cx.fillStyle='#e8f7ff';cx.font='600 26px '+FONT;cx.textBaseline='middle';
+  cx.fillText('CONSTELLATION STATUS',24,29);
+  cx.fillStyle='#ff9f43';cx.font='16px '+FONT;cx.textAlign='right';
+  cx.fillText('GMT '+utc()+'   ·   NET 4/4   ·   MODE: AUTO',w-24,29);
+  cx.textAlign='left';
+  var mapX=20,mapY=74,mapW=w-420,mapH=h-mapY-66;
+  // map frame + grid
+  cx.fillStyle='#050d18';cx.fillRect(mapX,mapY,mapW,mapH);
+  cx.strokeStyle='rgba(70,150,190,.4)';cx.lineWidth=2;cx.strokeRect(mapX,mapY,mapW,mapH);
+  cx.strokeStyle='rgba(70,150,190,.16)';cx.lineWidth=1;cx.beginPath();
+  for(var lon=-150;lon<=150;lon+=30){var x=mapX+(lon+180)/360*mapW;cx.moveTo(x,mapY);cx.lineTo(x,mapY+mapH);}
+  for(var lat=-60;lat<=60;lat+=30){var y=mapY+(90-lat)/180*mapH;cx.moveTo(mapX,y);cx.lineTo(mapX+mapW,y);}
+  cx.stroke();
+  cx.strokeStyle='rgba(120,200,235,.35)';cx.beginPath();
+  var eq=mapY+mapH/2;cx.moveTo(mapX,eq);cx.lineTo(mapX+mapW,eq);cx.stroke();
+  function PX(p){return {x:mapX+(p.lon+180)/360*mapW, y:mapY+(90-p.lat)/180*mapH};}
+  // stations
+  STATIONS.forEach(function(st){
+    var q=PX(st);
+    cx.fillStyle='#ffbe45';cx.beginPath();cx.arc(q.x,q.y,4,0,6.283);cx.fill();
+    cx.strokeStyle='rgba(255,190,69,.4)';cx.beginPath();cx.arc(q.x,q.y,9,0,6.283);cx.stroke();
+    cx.fillStyle='#c9d8df';cx.font='11px '+FONT;cx.fillText(st.name,q.x+12,q.y+1);
+  });
+  // sats + tracks
+  SATS.forEach(function(s){
+    var p=subpoint(s,sim.t),q=PX(p);
+    cx.strokeStyle=s.color;cx.globalAlpha=0.65;cx.lineWidth=2;cx.beginPath();
+    var prev=null;
+    for(var dt=-2400;dt<=1500;dt+=60){
+      var pp=PX(subpoint(s,sim.t+dt));
+      if(prev&&Math.abs(pp.x-prev.x)<mapW*0.5){cx.lineTo(pp.x,pp.y);}else{cx.moveTo(pp.x,pp.y);}
+      prev=pp;
+    }
+    cx.stroke();cx.globalAlpha=1;
+    if(!s.geo){cx.strokeStyle=s.color;cx.globalAlpha=.25;cx.beginPath();cx.arc(q.x,q.y,mapH*0.16,0,6.283);cx.stroke();cx.globalAlpha=1;}
+    if(s.inPass&&s.passStation){var g=PX(s.passStation);cx.strokeStyle='#8affc1';cx.setLineDash([6,5]);cx.lineWidth=2;cx.beginPath();cx.moveTo(q.x,q.y);cx.lineTo(g.x,g.y);cx.stroke();cx.setLineDash([]);}
+    cx.fillStyle=s.color;cx.save();cx.translate(q.x,q.y);cx.rotate(Math.PI/4);cx.fillRect(-6,-6,12,12);cx.restore();
+    cx.font='600 13px '+FONT;cx.fillText(s.name,q.x+12,q.y-10);
+  });
+  // right panel
+  var px=mapX+mapW+22,pw=w-px-22;
+  cx.fillStyle='#8fb9c9';cx.font='12px '+FONT;cx.fillText('SPACECRAFT',px,mapY+4);
+  SATS.forEach(function(s,i){
+    var y=mapY+22+i*((mapH-24)/3),bh=(mapH-24)/3-14;
+    cx.fillStyle='rgba(12,28,42,.8)';cx.fillRect(px,y,pw,bh);
+    cx.strokeStyle=s.inPass?'rgba(138,255,193,.5)':'rgba(70,150,190,.3)';cx.strokeRect(px,y,pw,bh);
+    cx.fillStyle=s.color;cx.font='600 17px '+FONT;cx.fillText(s.name,px+14,y+22);
+    cx.fillStyle=s.inPass?'#8affc1':'#6d93a3';cx.font='600 13px '+FONT;cx.textAlign='right';
+    cx.fillText(s.mode+(s.inPass&&s.passStation?' · '+s.passStation.name:''),px+pw-14,y+22);
+    cx.textAlign='left';
+    cx.fillStyle='#8fb9c9';cx.font='12px '+FONT;
+    cx.fillText(s.geo?'GEO 35786 KM':'LEO '+(s.incl.toFixed(1))+'° INC',px+14,y+44);
+    cx.fillText(s.inPass?('LOS  '+mmss(s.los/14)):('AOS  '+mmss(s.aos/14)),px+14,y+62);
+    // Eb/N0 bar
+    var bx=px+150,bw=pw-170,frac=clamp(s.ebno/15,0,1);
+    cx.fillStyle='rgba(70,150,190,.18)';cx.fillRect(bx,y+38,bw,10);
+    cx.fillStyle=s.ebno>6?'#5fd0f0':'#ffbe45';cx.fillRect(bx,y+38,bw*frac,10);
+    cx.fillStyle='#cfeefb';cx.font='12px '+FONT;
+    cx.fillText('Eb/N0 '+s.ebno.toFixed(1)+' dB   ·   '+s.rate+' Mbps',bx,y+62);
+    // subsystem dots
+    SUBS.forEach(function(k,j){
+      var st=s.subs[k];cx.fillStyle=st==='OK'?'#2f8f6e':sevColor(st);
+      cx.fillRect(px+14+j*((pw-28)/6),y+bh-16,(pw-28)/6-6,7);
+    });
+  });
+  // ticker
+  cx.fillStyle='rgba(18,46,66,.55)';cx.fillRect(0,h-46,w,46);
+  cx.fillStyle='#ffbe45';cx.font='600 15px '+FONT;
+  cx.fillText('▮ '+sim.ticker,24,h-23);
+  cx.fillStyle='#5aa8c4';cx.textAlign='right';cx.font='13px '+FONT;
+  cx.fillText('UPLINK ARRAY A NOMINAL · RF INHIBIT CLEAR · REC: ON',w-24,h-23);
+  cx.textAlign='left';
+}
+
+/* ---- console monitor draws ---- */
+function drawTelemetry(sat){return function(cx,w,h){
+  panelBG(cx,w,h,sat.name+' · RF TELEMETRY','LIVE');
+  function chart(y0,hh,arr,min,max,color,label,unit){
+    cx.fillStyle='rgba(10,24,38,.7)';cx.fillRect(14,y0,w-28,hh);
+    cx.strokeStyle='rgba(70,150,190,.2)';cx.strokeRect(14,y0,w-28,hh);
+    cx.beginPath();cx.strokeStyle=color;cx.lineWidth=2;
+    for(var i=0;i<arr.length;i++){
+      var x=14+(w-28)*i/129, y=y0+hh-(clamp(arr[i],min,max)-min)/(max-min)*hh;
+      if(i===0)cx.moveTo(x,y);else cx.lineTo(x,y);
+    }
+    cx.stroke();
+    cx.fillStyle='#8fb9c9';cx.font='11px '+FONT;cx.fillText(label,20,y0+14);
+    cx.fillStyle=color;cx.font='600 16px '+FONT;cx.textAlign='right';
+    cx.fillText((arr.length?arr[arr.length-1].toFixed(1):'--')+' '+unit,w-22,y0+16);cx.textAlign='left';
+  }
+  chart(46,(h-70)/2-8,sat.hist.ebno,0,15,'#5fd0f0','Eb/N0','dB');
+  chart(46+(h-70)/2+8,(h-70)/2-8,sat.hist.agc,-62,-40,'#8affc1','AGC','dBm');
+};}
+function drawStatus(sat){return function(cx,w,h){
+  panelBG(cx,w,h,sat.name+' · SUBSYSTEMS',sat.mode);
+  var cols=3,rows=2,gw=(w-28-(cols-1)*8)/cols,gh=(h-52-(rows-1)*8)/rows;
+  SUBS.forEach(function(k,i){
+    var x=14+(i%cols)*(gw+8),y=44+Math.floor(i/cols)*(gh+8),st=sat.subs[k];
+    cx.fillStyle=st==='OK'?'rgba(24,70,56,.55)':(st==='WARN'?'rgba(96,70,16,.6)':'rgba(96,24,24,.6)');
+    cx.fillRect(x,y,gw,gh);
+    cx.strokeStyle=st==='OK'?'rgba(90,200,150,.4)':sevColor(st);cx.strokeRect(x,y,gw,gh);
+    cx.fillStyle='#cfeefb';cx.font='600 14px '+FONT;cx.fillText(k,x+10,y+20);
+    cx.fillStyle=st==='OK'?'#8affc1':sevColor(st);cx.font='600 18px '+FONT;
+    cx.fillText(st,x+10,y+gh-16);
+  });
+};}
+var specBars=[];for(var i=0;i<52;i++)specBars.push(rnd(.05,.2));
+function drawSpectrum(cx,w,h){
+  panelBG(cx,w,h,'IF SPECTRUM · 70 MHZ','RBW 30K');
+  var y0=46,hh=h-92,n=specBars.length,bw=(w-28)/n,carrier=(Math.sin(sim.t/900)+1)/2;
+  for(var i=0;i<n;i++){
+    var f=i/n, peak=Math.exp(-Math.pow((f-0.5-0.12*Math.sin(sim.t/700))/0.05,2));
+    var pass=SATS[0].inPass||SATS[1].inPass?1:0.25;
+    specBars[i]+= (rnd(.03,.14)+peak*pass*rnd(.5,.95)+carrier*0.03-specBars[i])*0.4;
+    var bh=clamp(specBars[i],0,1)*hh;
+    cx.fillStyle=peak>0.4?'#5fd0f0':'rgba(95,208,240,.42)';
+    cx.fillRect(14+i*bw,y0+hh-bh,bw-2,bh);
+  }
+  cx.strokeStyle='rgba(255,159,67,.6)';cx.setLineDash([5,4]);
+  cx.beginPath();cx.moveTo(14,y0+hh*0.25);cx.lineTo(w-14,y0+hh*0.25);cx.stroke();cx.setLineDash([]);
+  cx.fillStyle='#8fb9c9';cx.font='11px '+FONT;cx.fillText('THRESH -92 dBm',18,y0+hh*0.25-6);
+  cx.fillText('69.4',14,h-18);cx.textAlign='center';cx.fillText('70.0 MHz',w/2,h-18);
+  cx.textAlign='right';cx.fillText('70.6',w-14,h-18);cx.textAlign='left';
+}
+function drawLog(cx,w,h){
+  panelBG(cx,w,h,'EVENT LOG','TAIL');
+  cx.font='12px '+FONT;
+  var n=Math.floor((h-56)/18);
+  for(var i=0;i<Math.min(n,sim.events.length);i++){
+    var e=sim.events[i],y=52+i*18;
+    cx.fillStyle='#4f7686';cx.fillText(e.t,14,y);
+    cx.fillStyle=sevColor(e.sev);cx.fillText(e.sev.padEnd(5,' '),92,y);
+    cx.fillStyle='#bfe6f4';cx.fillText(e.txt.slice(0,46),146,y);
+  }
+}
+function drawLink(sat){return function(cx,w,h){
+  panelBG(cx,w,h,sat.name+' · LINK BUDGET','KA-BAND');
+  var rows=[
+    ['UPLINK MARGIN', clamp((sat.ebno-3)*0.9+rnd(-.2,.2),0,10),10,'dB'],
+    ['DOWNLINK MARGIN',clamp(sat.ebno-4.5+rnd(-.2,.2),0,10),10,'dB'],
+    ['EIRP',54+ (sat.inPass?2:0)+rnd(-.4,.4),60,'dBW'],
+    ['G/T',31.2+rnd(-.2,.2),40,'dB/K']
+  ];
+  rows.forEach(function(r,i){
+    var y=52+i*((h-70)/4);
+    cx.fillStyle='#8fb9c9';cx.font='12px '+FONT;cx.fillText(r[0],14,y+4);
+    var bx=14,bw=w-120,frac=clamp(r[1]/r[2],0,1);
+    cx.fillStyle='rgba(70,150,190,.18)';cx.fillRect(bx,y+12,bw,12);
+    cx.fillStyle=frac>0.35?'#5fd0f0':'#ffbe45';cx.fillRect(bx,y+12,bw*frac,12);
+    cx.fillStyle='#e8f7ff';cx.font='600 15px '+FONT;cx.textAlign='right';
+    cx.fillText(r[1].toFixed(1)+' '+r[3],w-14,y+20);cx.textAlign='left';
+  });
+};}
+function drawPasses(cx,w,h){
+  panelBG(cx,w,h,'UPCOMING CONTACTS','SCHED');
+  cx.font='12px '+FONT;cx.fillStyle='#4f7686';
+  cx.fillText('SC        SITE          AOS     DUR',14,52);
+  var row=0;
+  SATS.forEach(function(s){
+    if(s.geo)return;
+    var y=74+row*24;row++;
+    cx.fillStyle=s.color;cx.fillText(s.name.padEnd(10,' '),14,y);
+    cx.fillStyle='#bfe6f4';
+    var site=s.passStation?s.passStation.name:nearestStation(subpoint(s,sim.t+s.aos)).st.name;
+    cx.fillText(site.padEnd(14,' '),110,y);
+    cx.fillStyle=s.inPass?'#8affc1':'#cfeefb';
+    cx.fillText(s.inPass?'IN PASS':mmss(s.aos/14),262,y);
+    cx.fillStyle='#8fb9c9';cx.fillText('~08:30',350,y);
+  });
+  cx.fillStyle='#8fb9c9';
+  cx.fillText('RELAY-7 (GEO): CONTINUOUS COVERAGE',14,74+row*24+6);
+  cx.fillStyle='rgba(255,159,67,.9)';cx.font='600 12px '+FONT;
+  cx.fillText('AUTOTRACK ENABLED · SCHEDULE LOCKED BY OPS DIRECTOR',14,h-18);
+}
+function drawGround(cx,w,h){
+  panelBG(cx,w,h,'GROUND NETWORK','WAN');
+  STATIONS.forEach(function(st,i){
+    var y=54+i*58;
+    var active=SATS.some(function(s){return s.passStation===st&&s.inPass;});
+    cx.fillStyle='rgba(12,28,42,.8)';cx.fillRect(14,y,w-28,48);
+    cx.strokeStyle=active?'rgba(138,255,193,.55)':'rgba(70,150,190,.3)';cx.strokeRect(14,y,w-28,48);
+    cx.fillStyle=active?'#8affc1':'#ffbe45';cx.beginPath();cx.arc(34,y+24,6,0,6.283);cx.fill();
+    cx.fillStyle='#e8f7ff';cx.font='600 15px '+FONT;cx.fillText(st.name,52,y+20);
+    cx.fillStyle='#8fb9c9';cx.font='11px '+FONT;
+    cx.fillText((st.lat).toFixed(1)+'°, '+(st.lon).toFixed(1)+'°  ·  FIBER OK  ·  '+(active?'CARRIER LOCK':'STANDBY'),52,y+38);
+  });
+  var y2=54+STATIONS.length*58+8;
+  cx.fillStyle='#4f7686';cx.font='11px '+FONT;
+  cx.fillText('LATENCY  WSC 4ms · WAL 11ms · KIR 78ms · GUM 102ms',14,y2+6);
+}
+
+/* ============================== ROOM BUILD ============================== */
+var colliders=[]; // {minX,maxX,minZ,maxZ}
+function addCollider(x,z,w,d){colliders.push({minX:x-w/2,maxX:x+w/2,minZ:z-d/2,maxZ:z+d/2});}
+var M={
+  floor:new THREE.MeshStandardMaterial({color:0xdfe2e6,roughness:0.55,metalness:0.05}),
+  wall:new THREE.MeshStandardMaterial({color:0xf1f2f4,roughness:0.92,metalness:0.0}),
+  slat:new THREE.MeshStandardMaterial({color:0xd9dce1,roughness:0.85}),
+  ceil:new THREE.MeshStandardMaterial({color:0xf4f5f7,roughness:0.95}),
+  desk:new THREE.MeshStandardMaterial({color:0x11161d,roughness:0.55,metalness:0.3}),
+  deskEdge:new THREE.MeshStandardMaterial({color:0x2a3542,roughness:0.5}),
+  dark:new THREE.MeshStandardMaterial({color:0x0a0e13,roughness:0.7,metalness:0.2}),
+  frame:new THREE.MeshStandardMaterial({color:0x05080c,roughness:0.45,metalness:0.5}),
+  chair:new THREE.MeshStandardMaterial({color:0x151a21,roughness:0.8}),
+  amber:new THREE.MeshBasicMaterial({color:0xff9f43}),
+  panelLight:new THREE.MeshBasicMaterial({color:0xcfe4f5})
+};
+// floor grid texture
+(function(){
+  var c=document.createElement('canvas');c.width=c.height=256;var x=c.getContext('2d');
+  x.fillStyle='#dfe2e6';x.fillRect(0,0,256,256);
+  x.strokeStyle='rgba(70,90,110,0.12)';x.lineWidth=2;x.strokeRect(0,0,256,256);
+  x.strokeStyle='rgba(70,90,110,0.05)';x.beginPath();x.moveTo(128,0);x.lineTo(128,256);x.moveTo(0,128);x.lineTo(256,128);x.stroke();
+  var t=new THREE.CanvasTexture(c);t.wrapS=t.wrapT=THREE.RepeatWrapping;t.repeat.set(ROOM.w/2,ROOM.d/2);t.encoding=THREE.sRGBEncoding;
+  M.floor.map=t;
+})();
+function box(w,h,d,mat,x,y,z,shadow){
+  var m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),mat);
+  m.position.set(x,y,z);
+  if(shadow!==false){m.castShadow=true;m.receiveShadow=true;}
+  scene.add(m);return m;
+}
+// shell
+var floor=new THREE.Mesh(new THREE.PlaneGeometry(ROOM.w,ROOM.d),M.floor);
+floor.rotation.x=-Math.PI/2;floor.receiveShadow=true;scene.add(floor);
+var ceil=new THREE.Mesh(new THREE.PlaneGeometry(ROOM.w,ROOM.d),M.ceil);
+ceil.rotation.x=Math.PI/2;ceil.position.y=ROOM.h;scene.add(ceil);
+box(ROOM.w,ROOM.h,0.2,M.wall,0,ROOM.h/2,-HALF_D-0.1,false).receiveShadow=true;
+box(ROOM.w,ROOM.h,0.2,M.wall,0,ROOM.h/2, HALF_D+0.1,false).receiveShadow=true;
+box(0.2,ROOM.h,ROOM.d,M.wall,-HALF_W-0.1,ROOM.h/2,0,false).receiveShadow=true;
+box(0.2,ROOM.h,ROOM.d,M.wall, HALF_W+0.1,ROOM.h/2,0,false).receiveShadow=true;
+// acoustic slats on side walls
+for(var si=0;si<18;si++){
+  box(0.06,9.4,0.28,M.slat,-HALF_W+0.06,4.95,-HALF_D+0.7+si*0.55,false);
+  if(si<7||si>11)box(0.06,9.4,0.28,M.slat,HALF_W-0.06,4.95,-HALF_D+0.7+si*0.55,false);
+}
+// amber accent line around walls
+box(ROOM.w-0.4,0.045,0.03,M.amber,0,2.55,-HALF_D+0.11,false);
+box(ROOM.w-0.4,0.045,0.03,M.amber,0,2.55, HALF_D-0.11,false);
+box(0.03,0.045,ROOM.d-0.4,M.amber,-HALF_W+0.11,2.55,0,false);
+box(0.03,0.045,ROOM.d-0.4,M.amber, HALF_W-0.11,2.55,0,false);
+// ceiling light panels
+[[-4.6,-2.6],[0,-2.6],[4.6,-2.6],[-4.6,1.8],[0,1.8],[4.6,1.8]].forEach(function(p){
+  var pl=new THREE.Mesh(new THREE.PlaneGeometry(2.8,1.2),M.panelLight);
+  pl.rotation.x=Math.PI/2;pl.position.set(p[0],ROOM.h-0.02,p[1]);scene.add(pl);
+  box(2.95,0.05,1.35,M.frame,p[0],ROOM.h-0.03,p[1],false);
+});
+
+/* ---- video wall ---- */
+var wallS=makeScreen(2048,640,drawWall,220,'Constellation status wall');
+var wallW=9.6,wallH=3.0;
+var wallGeo=new THREE.PlaneGeometry(wallW,wallH);
+var wallMat=new THREE.MeshStandardMaterial({color:0x000000,emissive:0xffffff,emissiveMap:wallS.tex,emissiveIntensity:1.05,roughness:0.4});
+var wallMesh=new THREE.Mesh(wallGeo,wallMat);
+wallMesh.position.set(0,1.72,-HALF_D+0.16);scene.add(wallMesh);
+wallS.mesh=wallMesh;wallS.normal=new THREE.Vector3(0,0,1);wallS.focusDist=3.4;
+box(wallW+0.24,wallH+0.24,0.1,M.frame,0,1.72,-HALF_D+0.09,false);
+// console cabinet under the wall
+box(10.4,0.85,0.55,M.desk,0,0.425,-HALF_D+0.55);addCollider(0,-HALF_D+0.55,10.4,0.7);
+box(10.4,0.05,0.6,M.deskEdge,0,0.875,-HALF_D+0.55,false);
+// room sign above
+(function(){
+  var c=document.createElement('canvas');c.width=512;c.height=96;var x=c.getContext('2d');
+  x.fillStyle='#05080c';x.fillRect(0,0,512,96);
+  x.fillStyle='#ff9f43';x.font='600 40px '+FONT;x.textAlign='center';x.textBaseline='middle';
+  x.fillText('OPS FLOOR 1',256,50);
+  var t=new THREE.CanvasTexture(c);t.encoding=THREE.sRGBEncoding;
+  var m=new THREE.Mesh(new THREE.PlaneGeometry(2.2,0.42),new THREE.MeshBasicMaterial({map:t}));
+  m.position.set(0,3.02,-HALF_D+0.12);scene.add(m);
+})();
+
+/* ---- desks + monitors ---- */
+function makeMonitor(drawFn,label,x,y,z,yaw,big){
+  var sw=big?0.98:0.72, sh=big?0.55:0.42;
+  var g=new THREE.Group();g.position.set(x,y,z);g.rotation.y=yaw;
+  var frame=new THREE.Mesh(new THREE.BoxGeometry(sw+0.05,sh+0.05,0.045),M.frame);
+  frame.castShadow=true;g.add(frame);
+  var scr=makeScreen(512,300,drawFn,260+((Math.random()*160)|0),label);
+  var mat=new THREE.MeshStandardMaterial({color:0x000000,emissive:0xffffff,emissiveMap:scr.tex,emissiveIntensity:0.95,roughness:0.35});
+  var mesh=new THREE.Mesh(new THREE.PlaneGeometry(sw,sh),mat);
+  mesh.position.z=0.026;g.add(mesh);
+  scr.mesh=mesh;scr.normal=new THREE.Vector3(0,0,1);scr.focusDist=big?1.15:0.92;
+  var stem=new THREE.Mesh(new THREE.CylinderGeometry(0.02,0.025,0.22,10),M.frame);
+  stem.position.set(0,-sh/2-0.1,-0.03);g.add(stem);
+  var base=new THREE.Mesh(new THREE.CylinderGeometry(0.11,0.13,0.02,14),M.frame);
+  base.position.set(0,-sh/2-0.21,-0.03);g.add(base);
+  scene.add(g);
+  return g;
+}
+function makeDesk(x,z,monA,monB,monC,labA,labB,labC){
+  box(2.6,0.06,0.475,M.desk,x,0.74,z);            // top (half depth)
+  box(2.6,0.02,0.475,M.deskEdge,x,0.775,z,false); // edge trim
+  box(2.5,0.66,0.06,M.dark,x,0.36,z+0.19);        // modesty panel
+  box(0.07,0.72,0.42,M.frame,x-1.22,0.37,z);      // legs
+  box(0.07,0.72,0.42,M.frame,x+1.22,0.37,z);
+  addCollider(x,z,2.7,0.62);
+  makeMonitor(monA,labA,x-0.82,1.28,z-0.09, 0.18,false);
+  makeMonitor(monB,labB,x,     1.30,z-0.13, 0.0 ,false);
+  makeMonitor(monC,labC,x+0.82,1.28,z-0.09,-0.18,false);
+}
+var row1z=-1.45,row2z=1.45;
+makeDesk(-4.6,row1z,drawTelemetry(SATS[0]),drawStatus(SATS[0]),drawLink(SATS[0]),'ASTER-9K telemetry','ASTER-9K subsystems','ASTER-9K link budget');
+makeDesk(  0.0,row1z,drawSpectrum,drawPasses,drawLog,'IF spectrum analyzer','Contact schedule','Event log');
+makeDesk( 4.6,row1z,drawTelemetry(SATS[1]),drawStatus(SATS[1]),drawLink(SATS[1]),'MERIDIAN-2 telemetry','MERIDIAN-2 subsystems','MERIDIAN-2 link budget');
+makeDesk(-4.6,row2z,drawGround,drawLog,drawSpectrum,'Ground network','Event log','IF spectrum analyzer');
+makeDesk(  0.0,row2z,drawTelemetry(SATS[2]),drawStatus(SATS[2]),drawLink(SATS[2]),'RELAY-7 telemetry','RELAY-7 subsystems','RELAY-7 link budget');
+makeDesk( 4.6,row2z,drawPasses,drawGround,drawTelemetry(SATS[0]),'Contact schedule','Ground network','ASTER-9K telemetry');
+
+/* ---- (right-wall board removed) ---- */
+
+/* ---- (racks, LEDs, and back-left cabinet removed) ---- */
+var leds=[];
+
+/* ============================== LIGHTING ============================== */
+scene.add(new THREE.HemisphereLight(0xffffff,0xcfd3d9,0.85));
+scene.add(new THREE.AmbientLight(0xffffff,0.32));
+function pl(x,y,z,color,inten,dist,shadow){
+  var L=new THREE.PointLight(color,inten,dist,2);
+  L.position.set(x,y,z);
+  if(shadow){L.castShadow=true;L.shadow.mapSize.set(1024,1024);L.shadow.bias=-0.002;}
+  scene.add(L);return L;
+}
+pl(0,6.4,-2.4,0xffffff,1.7,34,true);
+pl(0,6.4,2.4,0xffffff,1.6,34,true);
+pl(-4.6,6.4,0,0xffffff,1.0,28,false);
+pl(4.6,6.4,0,0xffffff,1.0,28,false);
+pl(0,1.9,-3.4,0x3fb6d8,0.3,7,false);       // wall display glow
+pl(-7.4,2.45,0,0xff9f43,0.12,5,false);     // amber accents
+pl(7.4,2.45,0,0xff9f43,0.12,5,false);
+
+/* ============================== PLAYER ============================== */
+var player={pos:new THREE.Vector3(-5.6,0,3.6),yaw:0.5,pitch:-0.03,vel:new THREE.Vector3(),r:0.32,eye:1.62,bob:0};
+var keys={};
+var locked=false, started=false, focus=null, focusAnim=null;
+var promptEl=document.getElementById('prompt');
+var startEl=document.getElementById('start');
+var isTouch=('ontouchstart' in window)&&navigator.maxTouchPoints>0;
+
+document.addEventListener('keydown',function(e){
+  keys[e.code]=true;
+  if(e.code==='KeyM')toggleMute();
+  if(e.code==='KeyE')tryInspect();
+});
+document.addEventListener('keyup',function(e){keys[e.code]=false;});
+document.addEventListener('mousemove',function(e){
+  if(!locked&&!dragLook.active)return;
+  var mx=locked?e.movementX:0,my=locked?e.movementY:0;
+  applyLook(mx,my);
+});
+function applyLook(mx,my){
+  if(focus)return;
+  player.yaw-=mx*0.0021;
+  player.pitch=clamp(player.pitch-my*0.0021,-1.35,1.35);
+}
+var dragLook={active:false,x:0,y:0};
+renderer.domElement.addEventListener('mousedown',function(e){
+  if(!started||locked)return;dragLook.active=true;dragLook.x=e.clientX;dragLook.y=e.clientY;
+});
+window.addEventListener('mousemove',function(e){
+  if(!dragLook.active)return;
+  applyLook(e.clientX-dragLook.x,e.clientY-dragLook.y);
+  dragLook.x=e.clientX;dragLook.y=e.clientY;
+});
+window.addEventListener('mouseup',function(){dragLook.active=false;});
+
+document.getElementById('enter').addEventListener('click',begin);
+function begin(){
+  started=true;startEl.style.display='none';
+  initAudio();
+  if(!isTouch){
+    try{renderer.domElement.requestPointerLock&&renderer.domElement.requestPointerLock();}catch(err){}
+  }else{document.body.classList.add('touch');}
+}
+renderer.domElement.addEventListener('click',function(){
+  if(started&&!locked&&!isTouch){try{renderer.domElement.requestPointerLock&&renderer.domElement.requestPointerLock();}catch(err){}}
+});
+document.addEventListener('pointerlockchange',function(){
+  locked=(document.pointerLockElement===renderer.domElement);
+});
+
+/* touch controls */
+var stickEl=document.getElementById('stick'),knobEl=document.getElementById('stickKnob');
+var touchMove={id:null,ox:0,oy:0,dx:0,dy:0},touchLook={id:null,x:0,y:0};
+function placeStick(x,y){stickEl.style.left=(x-55)+'px';stickEl.style.top=(y-55)+'px';knobEl.style.left=(x-22)+'px';knobEl.style.top=(y-22)+'px';}
+window.addEventListener('touchstart',function(e){
+  if(!started)return;
+  for(var i=0;i<e.changedTouches.length;i++){var t=e.changedTouches[i];
+    if(t.clientX<window.innerWidth*0.45&&touchMove.id===null){touchMove.id=t.identifier;touchMove.ox=t.clientX;touchMove.oy=t.clientY;touchMove.dx=touchMove.dy=0;placeStick(t.clientX,t.clientY);}
+    else if(touchLook.id===null){touchLook.id=t.identifier;touchLook.x=t.clientX;touchLook.y=t.clientY;}
+  }
+},{passive:true});
+window.addEventListener('touchmove',function(e){
+  for(var i=0;i<e.changedTouches.length;i++){var t=e.changedTouches[i];
+    if(t.identifier===touchMove.id){touchMove.dx=clamp((t.clientX-touchMove.ox)/45,-1,1);touchMove.dy=clamp((t.clientY-touchMove.oy)/45,-1,1);knobEl.style.left=(touchMove.ox+touchMove.dx*35-22)+'px';knobEl.style.top=(touchMove.oy+touchMove.dy*35-22)+'px';}
+    if(t.identifier===touchLook.id){applyLook((t.clientX-touchLook.x)*2.4,(t.clientY-touchLook.y)*2.4);touchLook.x=t.clientX;touchLook.y=t.clientY;}
+  }
+},{passive:true});
+window.addEventListener('touchend',function(e){
+  for(var i=0;i<e.changedTouches.length;i++){var t=e.changedTouches[i];
+    if(t.identifier===touchMove.id){touchMove.id=null;touchMove.dx=touchMove.dy=0;}
+    if(t.identifier===touchLook.id){
+      touchLook.id=null;
+      if(promptTarget&&promptEl.style.display==='block')tryInspect(); // tap while prompt shown
+    }
+  }
+},{passive:true});
+
+/* collision: circle vs AABBs, plus room bounds */
+function collide(p){
+  p.x=clamp(p.x,-HALF_W+player.r+0.12,HALF_W-player.r-0.12);
+  p.z=clamp(p.z,-HALF_D+player.r+0.12,HALF_D-player.r-0.12);
+  for(var i=0;i<colliders.length;i++){
+    var c=colliders[i];
+    var cx=clamp(p.x,c.minX,c.maxX),cz=clamp(p.z,c.minZ,c.maxZ);
+    var dx=p.x-cx,dz=p.z-cz,d2=dx*dx+dz*dz;
+    if(d2<player.r*player.r){
+      var d=Math.sqrt(d2)||0.0001;
+      p.x=cx+dx/d*player.r;p.z=cz+dz/d*player.r;
+    }
+  }
+}
+
+/* inspect mode */
+var ray=new THREE.Raycaster();
+var promptTarget=null;
+function aimScreen(){
+  ray.setFromCamera({x:0,y:0},camera);
+  var meshes=screens.map(function(s){return s.mesh;}).filter(Boolean);
+  var hits=ray.intersectObjects(meshes,false);
+  if(hits.length&&hits[0].distance<3.6){
+    var m=hits[0].object;
+    for(var i=0;i<screens.length;i++)if(screens[i].mesh===m)return screens[i];
+  }
+  return null;
+}
+function camPoseFor(scr){
+  var wp=new THREE.Vector3();scr.mesh.getWorldPosition(wp);
+  var n=scr.normal.clone();
+  var q=new THREE.Quaternion();scr.mesh.getWorldQuaternion(q);n.applyQuaternion(q).normalize();
+  var pos=wp.clone().add(n.clone().multiplyScalar(scr.focusDist));
+  var dir=wp.clone().sub(pos);
+  var yaw2=Math.atan2(-dir.x,-dir.z);
+  var pitch=Math.atan2(dir.y,Math.sqrt(dir.x*dir.x+dir.z*dir.z));
+  return {pos:pos,yaw:yaw2,pitch:pitch};
+}
+function tryInspect(){
+  if(!started)return;
+  if(focus){ // exit
+    focusAnim={t:0,fromPos:camera.position.clone(),fromYaw:player.yaw,fromPitch:player.pitch,
+               toPos:new THREE.Vector3(focus.back.x,focus.back.y,focus.back.z),toYaw:focus.backYaw,toPitch:focus.backPitch,exit:true};
+    focus=null;return;
+  }
+  var scr=promptTarget||aimScreen();
+  if(!scr)return;
+  var pose=camPoseFor(scr);
+  focus={scr:scr,back:camera.position.clone(),backYaw:player.yaw,backPitch:player.pitch};
+  focusAnim={t:0,fromPos:camera.position.clone(),fromYaw:player.yaw,fromPitch:player.pitch,
+             toPos:pose.pos,toYaw:pose.yaw,toPitch:pose.pitch,exit:false};
+}
+
+/* ============================== AUDIO ============================== */
+var audio={ctx:null,gain:null,muted:false};
+function initAudio(){
+  try{
+    var AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
+    var ctx=new AC();
+    var master=ctx.createGain();master.gain.value=0.05;master.connect(ctx.destination);
+    var len=2*ctx.sampleRate,buf=ctx.createBuffer(1,len,ctx.sampleRate),data=buf.getChannelData(0),last=0;
+    for(var i=0;i<len;i++){var w=Math.random()*2-1;last=(last+0.02*w)/1.02;data[i]=last*3.2;}
+    var src=ctx.createBufferSource();src.buffer=buf;src.loop=true;
+    var lp=ctx.createBiquadFilter();lp.type='lowpass';lp.frequency.value=240;
+    src.connect(lp);lp.connect(master);src.start();
+    var osc=ctx.createOscillator();osc.type='sine';osc.frequency.value=118;
+    var og=ctx.createGain();og.gain.value=0.16;osc.connect(og);og.connect(master);osc.start();
+    audio.ctx=ctx;audio.gain=master;
+  }catch(err){}
+}
+function toggleMute(){
+  if(!audio.gain)return;
+  audio.muted=!audio.muted;
+  audio.gain.gain.value=audio.muted?0:0.05;
+}
+
+/* ============================== MAIN LOOP ============================== */
+var clock=new THREE.Clock();
+var tmpF=new THREE.Vector3(),tmpR=new THREE.Vector3();
+function animate(){
+  requestAnimationFrame(animate);
+  var dt=Math.min(clock.getDelta(),0.05);
+  if(started)simTick(dt);
+
+  // movement
+  if(started&&!focus&&!focusAnim){
+    var fwd=(keys['KeyW']?1:0)-(keys['KeyS']?1:0)-(touchMove.dy||0);
+    var str=(keys['KeyD']?1:0)-(keys['KeyA']?1:0)+(touchMove.dx||0);
+    fwd=clamp(fwd,-1,1);str=clamp(str,-1,1);
+    var run=keys['ShiftLeft']||keys['ShiftRight'];
+    var speed=(run?4.4:2.5);
+    tmpF.set(-Math.sin(player.yaw),0,-Math.cos(player.yaw));
+    tmpR.set(Math.cos(player.yaw),0,-Math.sin(player.yaw));
+    var ax=(tmpF.x*fwd+tmpR.x*str),az=(tmpF.z*fwd+tmpR.z*str);
+    var al=Math.sqrt(ax*ax+az*az);if(al>1){ax/=al;az/=al;}
+    player.vel.x+= (ax*speed-player.vel.x)*Math.min(1,dt*10);
+    player.vel.z+= (az*speed-player.vel.z)*Math.min(1,dt*10);
+    player.pos.x+=player.vel.x*dt;player.pos.z+=player.vel.z*dt;
+    collide(player.pos);
+    var sp=Math.sqrt(player.vel.x*player.vel.x+player.vel.z*player.vel.z);
+    player.bob+=sp*dt*4.6;
+    var bobY=Math.sin(player.bob)*0.03*Math.min(1,sp/2.4);
+    camera.position.set(player.pos.x,player.eye+bobY,player.pos.z);
+    camera.rotation.set(0,0,0);
+    camera.rotation.order='YXZ';
+    camera.rotation.y=player.yaw;camera.rotation.x=player.pitch;
+  }
+  // focus animation
+  if(focusAnim){
+    focusAnim.t+=dt/0.55;var k=clamp(focusAnim.t,0,1);k=k*k*(3-2*k);
+    camera.position.lerpVectors(focusAnim.fromPos,focusAnim.toPos,k);
+    var yA=focusAnim.fromYaw,yB=focusAnim.toYaw;
+    var dY=Math.atan2(Math.sin(yB-yA),Math.cos(yB-yA));
+    player.yaw=yA+dY*k;
+    player.pitch=focusAnim.fromPitch+(focusAnim.toPitch-focusAnim.fromPitch)*k;
+    camera.rotation.order='YXZ';camera.rotation.y=player.yaw;camera.rotation.x=player.pitch;camera.rotation.z=0;
+    if(k>=1){
+      if(focusAnim.exit){player.pos.x=camera.position.x;player.pos.z=camera.position.z;}
+      focusAnim=null;
+    }
+  }else if(focus){
+    camera.rotation.order='YXZ';camera.rotation.y=player.yaw;camera.rotation.x=player.pitch;
+  }
+
+  // prompt
+  if(started&&!focusAnim){
+    if(focus){promptEl.style.display='block';promptEl.textContent='[E] STEP BACK';promptTarget=null;}
+    else{
+      promptTarget=aimScreen();
+      if(promptTarget){promptEl.style.display='block';promptEl.textContent=(isTouch?'[TAP] ':'[E] ')+'INSPECT — '+promptTarget.label.toUpperCase();}
+      else promptEl.style.display='none';
+    }
+  }
+
+  // screens refresh (staggered)
+  var now=performance.now();
+  for(var i=0;i<screens.length;i++){
+    var s=screens[i];
+    if(now-s.last>s.interval){
+      s.last=now;s.draw(s.cx,s.cv.width,s.cv.height);s.tex.needsUpdate=true;
+    }
+  }
+  // rack LEDs blink
+  for(var j=0;j<leds.length;j++){
+    var L=leds[j];
+    L.m.visible=(Math.sin(now/1000*Math.PI*2/L.p+L.o)>-0.35);
+  }
+  renderer.render(scene,camera);
+}
+camera.position.set(player.pos.x,player.eye,player.pos.z);
+camera.rotation.order='YXZ';camera.rotation.y=player.yaw;
+animate();
+
+window.addEventListener('resize',function(){
+  camera.aspect=window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth,window.innerHeight);
+});
+})();
+</script>
+</body>
+</html>

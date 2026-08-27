@@ -1,0 +1,18 @@
+# Binary assets: no textual diff, no merge attempts. Keeping these in plain git
+# is fine while the repo has no remote; if one is added, migrate *.blend, *.glb,
+# *.png and the MIL-STD PDF to git-lfs before the first push (git-lfs is not
+# installed in this container, so it could not be configured here).
+*.blend   binary
+*.glb     binary
+*.gltf    binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.pdf     binary
+
+# Keep lockfiles collapsed in diffs
+package-lock.json  -diff
+Cargo.lock         -diff
+
+# Normalise line endings for text
+* text=auto eol=lf

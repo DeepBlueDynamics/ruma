@@ -1,0 +1,24 @@
+{
+  "name": "ops-room-client",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "test": "tsc --noEmit && vitest run",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@xterm/xterm": "^6.0.0",
+    "three": "^0.179.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.3.0",
+    "@types/three": "^0.179.0",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.1",
+    "vitest": "^3.2.7"
+  }
+}
