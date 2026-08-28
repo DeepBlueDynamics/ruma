@@ -1139,6 +1139,43 @@ renderer.domElement.addEventListener('wheel', event => {
   saveCamera();
 }, { passive: false, capture: true });
 
+// WASD walks the camera in the ground plane; the look direction steers.
+const WALK_SPEED = 3.5;
+const walkKeys: Record<string, boolean> = { w: false, a: false, s: false, d: false };
+addEventListener('keydown', event => {
+  const key = event.key.toLowerCase();
+  if (!(key in walkKeys) || event.repeat || event.metaKey || event.ctrlKey || event.altKey) return;
+  walkKeys[key] = true;
+});
+addEventListener('keyup', event => {
+  const key = event.key.toLowerCase();
+  if (!(key in walkKeys)) return;
+  walkKeys[key] = false;
+  if (!walkKeys.w && !walkKeys.a && !walkKeys.s && !walkKeys.d) saveCamera();
+});
+let lastWalkTick = performance.now();
+
+function applyWalk(now: number): void {
+  const dt = Math.min(0.05, (now - lastWalkTick) / 1000);
+  lastWalkTick = now;
+  if (cameraMove) return;
+  const surge = (walkKeys.w ? 1 : 0) - (walkKeys.s ? 1 : 0);
+  const strafe = (walkKeys.d ? 1 : 0) - (walkKeys.a ? 1 : 0);
+  if (!surge && !strafe) return;
+  const forward = new THREE.Vector3();
+  camera.getWorldDirection(forward);
+  forward.y = 0;
+  if (forward.lengthSq() < 1e-6) return;
+  forward.normalize();
+  const step = new THREE.Vector3()
+    .addScaledVector(forward, surge)
+    .addScaledVector(new THREE.Vector3(-forward.z, 0, forward.x), strafe)
+    .normalize()
+    .multiplyScalar(WALK_SPEED * dt);
+  camera.position.add(step);
+  controls.target.add(step);
+}
+
 addEventListener('keydown', event => {
   const desk = desks.get(selectedDeskId);
   if (!desk || !['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown'].includes(event.key)) return;
@@ -2823,6 +2860,7 @@ function frame(now: number): void {
     controls.target.lerpVectors(cameraMove.fromTarget, cameraMove.toTarget, eased);
     if (t === 1) { cameraMove = undefined; seatLookTarget(); saveCamera(); }
   }
+  applyWalk(now);
   controls.update();
   streamBroker.tick(camera);
   paintDirtyTabStreams();
