@@ -620,7 +620,7 @@ function selectDesk(id: string): void {
   drawAllDeskHuds();
   // Clicking the desk body is always navigation, including re-selecting the
   // current desk after orbiting away or leaning into a monitor.
-  if (returnToRoom) focusRoom();
+  if (returnToRoom) focusDisplayZone(nearestViewerToDesk(desk));
   else {
     focusDesk(id);
     status.textContent = `${desk.label.toUpperCase()} SELECTED`;
@@ -728,15 +728,6 @@ function resolveMonitorIndex(object: THREE.Object3D): number | undefined {
   return undefined;
 }
 
-
-function focusRoom(): void {
-  focusedScreen = undefined; deskViewId = undefined;
-  controls.minDistance = .65; controls.zoomSpeed = 1;
-  camera.fov = 46; camera.updateProjectionMatrix();
-  const overview = roomOverviewPose();
-  beginCameraMove(overview.position, overview.target);
-  status.textContent = 'COMMAND ROOM OVERVIEW';
-}
 
 function focusDesk(id: string): void {
   const desk = desks.get(id); if (!desk) return;
@@ -2437,8 +2428,9 @@ function removeDesk(stationId: string): void {
   }
   drawAllDeskHuds();
   status.textContent = `${desk.label.toUpperCase()} REMOVED`;
-  const display = record?.display ?? nearestDisplayToDesk(desk);
-  const viewer = wallViewers.find(v => v.controller.displayIndex === display);
+  const viewer = record
+    ? wallViewers.find(v => v.controller.displayIndex === record.display)
+    : nearestViewerToDesk(desk);
   if (viewer) focusWallScreen(viewer);
 }
 
@@ -2456,10 +2448,10 @@ function nearestViewerByAzimuth(azimuth: number): WallViewer {
 }
 
 /** Which wall arc a desk faces. */
-function nearestDisplayToDesk(desk: DeskStation): number {
+function nearestViewerToDesk(desk: DeskStation): WallViewer {
   const position = new THREE.Vector3();
   desk.object.getWorldPosition(position);
-  return nearestViewerByAzimuth(Math.atan2(position.z, position.x)).controller.displayIndex;
+  return nearestViewerByAzimuth(Math.atan2(position.z, position.x));
 }
 
 resetView.addEventListener('click', () => {
