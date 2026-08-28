@@ -8,9 +8,7 @@ import { cssColor, normalizeCell, normalizeGridRows, paneChrome } from '../hyper
 import { packTabTiles } from '../hyperia/tab-stream';
 import { panoramicTheaterRoom } from '../config/rooms/panoramic-theater';
 import { normalizeBays, StateStoreV3 } from '../state/store';
-import * as THREE from 'three';
 import { nextSpawnedDeskStationId, normalizeSpawnedDesks, spawnedDeskOrdinal } from '../state/spawned-desks';
-import { wallUnitFramingPose } from '../scene/wall-unit';
 
 /**
  * These assertions used to be `console.assert`, which neither throws nor sets a
@@ -157,58 +155,6 @@ export const architectureChecks: Check[] = [
       assert(nextSpawnedDeskStationId(records, 1) === 'viewer1-desk-1', 'display 1 reuses ordinal 1');
       assert(nextSpawnedDeskStationId(records, 2) === 'viewer2-desk-2', 'display 2 skips its live desk');
       assert(spawnedDeskOrdinal('viewer1-desk-3') === 3 && spawnedDeskOrdinal('garbage') === 0, 'ordinal parsing');
-    },
-  },
-  {
-    name: 'Wall-unit framing pose contains all three screens',
-    run: () => {
-      // Approximate the authored arcs: three screens on a radius-20.6 cylinder
-      // at azimuths 0° and ±120°, glass from y 2.67 to 9.78. The pose must sit
-      // level on the unit's bisector and keep every corner inside the 38°
-      // vertical / aspect-derived horizontal frustum, wall centered.
-      const vFov = 38;
-      const aspect = 16 / 9;
-      const radius = 20.6;
-      const boxFor = (azimuthDeg: number): THREE.Box3 => {
-        const box = new THREE.Box3();
-        for (const edge of [-46, 46]) {
-          const angle = THREE.MathUtils.degToRad(azimuthDeg + edge);
-          box.expandByPoint(new THREE.Vector3(Math.cos(angle) * radius, 2.67, Math.sin(angle) * radius));
-          box.expandByPoint(new THREE.Vector3(Math.cos(angle) * radius, 9.78, Math.sin(angle) * radius));
-        }
-        return box;
-      };
-      const boxes = [boxFor(0), boxFor(-120), boxFor(120)];
-      const bisector = THREE.MathUtils.degToRad(-120);
-      const pose = wallUnitFramingPose(boxes, bisector, vFov, aspect);
-      assert(!!pose, 'pose exists for non-empty boxes');
-
-      const union = new THREE.Box3();
-      for (const box of boxes) union.union(box);
-      const center = union.getCenter(new THREE.Vector3());
-      assert(pose.target.distanceTo(center) < 1e-6, 'wall unit is centered');
-      assert(Math.abs(pose.position.y - center.y) < 1e-6, 'camera stays level with the wall');
-
-      const forward = new THREE.Vector3(Math.cos(bisector), 0, Math.sin(bisector));
-      const onBisector = pose.target.clone().sub(pose.position).normalize();
-      assert(onBisector.distanceTo(forward) < 1e-6, 'camera sits on the angular bisector looking at the wall');
-
-      const right = new THREE.Vector3(-forward.z, 0, forward.x);
-      const tanV = Math.tan(THREE.MathUtils.degToRad(vFov) / 2);
-      const tanH = tanV * aspect;
-      for (const box of boxes) {
-        for (const x of [box.min.x, box.max.x])
-          for (const y of [box.min.y, box.max.y])
-            for (const z of [box.min.z, box.max.z]) {
-              const d = new THREE.Vector3(x, y, z).sub(pose.position);
-              const depth = forward.dot(d);
-              assert(depth > 0, 'every corner is in front of the camera');
-              assert(Math.abs(d.y) <= tanV * depth + 1e-9, `corner escapes the vertical FOV at (${x.toFixed(1)},${y.toFixed(1)},${z.toFixed(1)})`);
-              assert(Math.abs(right.dot(d)) <= tanH * depth + 1e-9, `corner escapes the horizontal FOV at (${x.toFixed(1)},${y.toFixed(1)},${z.toFixed(1)})`);
-            }
-      }
-
-      assert(wallUnitFramingPose([new THREE.Box3()], bisector, vFov, aspect) === undefined, 'empty bounds yield no pose');
     },
   },
   {

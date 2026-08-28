@@ -1,10 +1,9 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
 import { Terminal } from '@xterm/xterm';
 import { createDisplaySurface, type DisplaySurface } from './display/surface';
 import { buildStationLayout, sampleSurfaceNormalAtStation, yawFromSurfaceNormal } from './scene/layout';
-import { meshMiddleAzimuth, wallUnitFramingPose } from './scene/wall-unit';
+import { meshMiddleAzimuth } from './scene/wall-unit';
 import { nextSpawnedDeskStationId, normalizeSpawnedDesks, SPAWNED_DESKS_KEY, spawnedDeskOrdinal, type SpawnedDeskRecord, type SpawnedDeskVariant } from './state/spawned-desks';
 import { recutFloorGrid } from './scene/floor-grid';
 import { removeRoomWallsAndCeiling } from './scene/room-cleanup';
@@ -28,7 +27,6 @@ import { openMonitorHousingFronts } from './scene/monitor-housing';
 import './style.css';
 
 installClientObservability();
-RectAreaLightUniformsLib.init();
 
 const streamBroker = new StreamBroker({ overviewFps: 10, focusedDistance: 6, releaseDistance: 8.5 });
 const releasingLeases = new Set<string>();
@@ -998,11 +996,14 @@ renderer.domElement.addEventListener('pointerup', event => {
   if (!hit && wallPointerTargets.length) {
     const wallHit = deskRaycaster.intersectObjects(wallPointerTargets, false)[0];
     if (!wallHit || floorOccludes(wallHit.distance)) return;
-    // Bezel (frame / light rail) clicks toggle the whole-wall framing move;
+    // Bezel (frame / light rail) clicks rotate to face that screen's unit;
     // glass clicks route through the display's canvas regions.
     if (wallHit.object.userData.wallBezel === true) {
       cancelPendingWallClick();
-      toggleWallUnitFocus();
+      const index = Number(wallHit.object.userData.screen_index
+        ?? (wallHit.object.name.match(/^Wall_Screen_([1-3])/) ?? [])[1]);
+      const viewer = wallViewers.find(v => v.controller.displayIndex === index) ?? wallViewers[1];
+      toggleWallScreenFocus(viewer);
       return;
     }
     const viewer = wallViewerForMesh(wallHit.object);
@@ -1180,12 +1181,15 @@ const wallScreenMeshes: THREE.Mesh[] = [];
 const wallBezelMeshes: THREE.Mesh[] = [];
 let wallPointerTargets: THREE.Object3D[] = [];
 
-const WALL_UNIT_FOV_DEG = 38;
+const WALL_FOCUS_FOV_DEG = 52;
 
-// Snapshot of the operator's camera before the wall-unit framing move, so a
-// second bezel click restores exactly where they were. Any other camera move
-// abandons the framing and returns the orbit limits it borrowed.
+// Snapshot of the operator's camera before a bezel focus move, so clicking
+// the same bezel again restores exactly where they were. Clicking a
+// different bezel swings to that screen while keeping the original return
+// point. Any other camera move abandons the focus and returns the orbit
+// limits it borrowed.
 let wallUnitReturn: {
+  displayIndex: number;
   position: THREE.Vector3;
   target: THREE.Vector3;
   fov: number;
@@ -1201,14 +1205,29 @@ function clearWallUnitFocus(): void {
 }
 
 /**
- * Bezel click: frame the ENTIRE three-screen wall unit. The pose sits on the
- * unit's angular bisector (the presentation arc's middle azimuth — screens 1
- * and 3 are symmetric about it) at the minimum standoff that fits all three
- * screens' world bounds inside the 38° vertical / aspect-derived horizontal
- * FOV. A second bezel click restores the pre-focus camera.
+ * The arc is concentric with the room axis, so its own centre of curvature
+ * is the one spot inside the room that sees the whole span without
+ * foreshortening. Sit just short of it rather than flat against the glass —
+ * the camera never leaves the room.
  */
-function toggleWallUnitFocus(): void {
-  if (wallUnitReturn) {
+function wallScreenFocusPose(viewer: WallViewer): { position: THREE.Vector3; target: THREE.Vector3 } | undefined {
+  if (!viewer.mesh) return;
+  const bounds = new THREE.Box3().setFromObject(viewer.mesh);
+  const target = bounds.getCenter(new THREE.Vector3());
+  const outward = new THREE.Vector3(target.x, 0, target.z);
+  const radius = outward.length() || 1;
+  outward.divideScalar(radius);
+  const position = outward.multiplyScalar(radius * .12).setY(target.y);
+  return { position, target };
+}
+
+/**
+ * Bezel click: rotate to face that screen's whole unit from inside the room.
+ * Same bezel again restores the pre-focus camera; a different bezel swings
+ * to it while keeping the original return point.
+ */
+function toggleWallScreenFocus(viewer: WallViewer): void {
+  if (wallUnitReturn && wallUnitReturn.displayIndex === viewer.controller.displayIndex) {
     const previous = wallUnitReturn;
     wallUnitReturn = undefined;
     camera.fov = previous.fov; camera.updateProjectionMatrix();
@@ -1219,12 +1238,10 @@ function toggleWallUnitFocus(): void {
     status.textContent = 'WALL FOCUS RELEASED';
     return;
   }
-  const anchor = presentationSurface ?? wallScreenMeshes[0];
-  if (!anchor || !wallScreenMeshes.length) return;
-  const boxes = wallScreenMeshes.map(mesh => new THREE.Box3().setFromObject(mesh));
-  const pose = wallUnitFramingPose(boxes, meshMiddleAzimuth(anchor), WALL_UNIT_FOV_DEG, camera.aspect);
+  const pose = wallScreenFocusPose(viewer);
   if (!pose) return;
-  const snapshot = {
+  const snapshot = wallUnitReturn ?? {
+    displayIndex: viewer.controller.displayIndex,
     position: camera.position.clone(),
     target: controls.target.clone(),
     fov: camera.fov,
@@ -1233,35 +1250,27 @@ function toggleWallUnitFocus(): void {
     zoomSpeed: controls.zoomSpeed,
   };
   focusedScreen = undefined; deskViewId = undefined; wallZoom = undefined;
-  for (const viewer of wallViewers) viewer.controller.setFocusedPane(undefined);
-  camera.fov = WALL_UNIT_FOV_DEG; camera.updateProjectionMatrix();
-  controls.minDistance = .65;
-  controls.zoomSpeed = 1;
-  // OrbitControls clamps radius every update; without this the framing pose
-  // would be dragged back inside the old orbit limit and fight the tween.
-  controls.maxDistance = Math.max(snapshot.maxDistance, pose.distance * 1.1);
+  for (const other of wallViewers) other.controller.setFocusedPane(undefined);
+  camera.fov = WALL_FOCUS_FOV_DEG; camera.updateProjectionMatrix();
+  controls.minDistance = .4;
+  controls.zoomSpeed = 1.1;
+  // OrbitControls clamps radius every update; keep the borrowed limit wide
+  // enough that the tween cannot be dragged back inside it.
+  controls.maxDistance = Math.max(snapshot.maxDistance, pose.position.distanceTo(pose.target) * 1.1);
   beginCameraMove(pose.position, pose.target);
-  wallUnitReturn = snapshot;
-  status.textContent = 'WALL UNIT FOCUS';
+  wallUnitReturn = { ...snapshot, displayIndex: viewer.controller.displayIndex };
+  status.textContent = viewer.controller.displayIndex === 2 ? 'MAIN SCREEN FOCUS' : `ROOM DISPLAY ${viewer.controller.displayIndex} FOCUS`;
 }
 
 function focusWallScreen(viewer: WallViewer): void {
-  if (!viewer.mesh) return;
+  const pose = wallScreenFocusPose(viewer);
+  if (!pose) return;
   focusedScreen = undefined; deskViewId = undefined;
   wallZoom = undefined;
   viewer.controller.setFocusedPane(undefined);
-  const bounds = new THREE.Box3().setFromObject(viewer.mesh);
-  const center = bounds.getCenter(new THREE.Vector3());
-  // The arc is concentric with the room axis, so its own centre of curvature is
-  // the only spot that sees the whole span without foreshortening. Sit just
-  // short of it rather than flat against the glass.
-  const outward = new THREE.Vector3(center.x, 0, center.z);
-  const radius = outward.length() || 1;
-  outward.divideScalar(radius);
-  const position = outward.multiplyScalar(radius * .12).setY(center.y);
   controls.minDistance = .4; controls.zoomSpeed = 1.1;
-  camera.fov = 52; camera.updateProjectionMatrix();
-  beginCameraMove(position, center);
+  camera.fov = WALL_FOCUS_FOV_DEG; camera.updateProjectionMatrix();
+  beginCameraMove(pose.position, pose.target);
   status.textContent = viewer.controller.displayIndex === 2 ? 'MAIN SCREEN' : `ROOM DISPLAY ${viewer.controller.displayIndex}`;
 }
 
@@ -1522,18 +1531,6 @@ roomLoader.loadRoom({
   // is gone; the capability survives as opsDebug.resetRoom() until it earns a
   // home on a physical desk surface.
 
-  // Broad ceiling illumination follows the six authored ceiling light rows.
-  for (const z of [-9, -5, -1, 3, 7, 11]) {
-    const light = new THREE.RectAreaLight(0xb9dfff, 24, 24, 2.2);
-    light.position.set(0, 9.9, z);
-    light.rotation.x = -Math.PI / 2;
-    scene.add(light);
-  }
-  // Cyan side-wall wash and cool spill from the colossal display.
-  for (const x of [-17.5, 17.5]) for (const z of [-9, -3, 3, 9]) {
-    const light = new THREE.PointLight(0x20bde8, 42, 10, 1.8);
-    light.position.set(x, 4.8, z); scene.add(light);
-  }
   status.textContent = 'PANORAMIC COMMAND THEATER ONLINE';
 });
 
@@ -1972,7 +1969,10 @@ AssetCache.getInstance().instantiate('/assets/standing_desk_sim_master.glb').the
       get spawnedDesks() { return spawnedDesks; },
       spawnDesk: (display: number, variant: SpawnedDeskVariant) => spawnDeskForDisplay(display, variant),
       removeSpawnedDesk,
-      toggleWallUnitFocus,
+      toggleWallScreenFocus: (display: number) => {
+        const viewer = wallViewers.find(x => x.controller.displayIndex === display);
+        if (viewer) toggleWallScreenFocus(viewer);
+      },
       setMonitorPower: (deskId: string, index: number, powered: boolean) => {
         const target = desks.get(deskId);
         if (target) setMonitorPower(target, index, powered);
