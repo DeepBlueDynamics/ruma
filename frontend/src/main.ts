@@ -705,7 +705,7 @@ function setOverviewCamera(): void {
   const overview = roomOverviewPose();
   camera.position.copy(overview.position);
   controls.target.copy(overview.target);
-  camera.fov = 46; camera.zoom = 1; camera.updateProjectionMatrix(); controls.update();
+  camera.fov = 46; camera.zoom = 1; camera.updateProjectionMatrix(); seatLookTarget(); controls.update();
 }
 
 function tagMonitorHierarchy(root: THREE.Object3D, monitorIndex: number): void {
@@ -948,12 +948,27 @@ const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.01, 1
 camera.position.set(1.35, 1.15, 2.35);
 camera.lookAt(0, 0.78, 0);
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(0, 0.78, 0);
 controls.enableDamping = true;
 controls.dampingFactor = 0.07;
-controls.minDistance = 0.65;
+controls.minDistance = 0.1;
 controls.maxDistance = 55;
+controls.minPolarAngle = Math.PI * 0.08;
 controls.maxPolarAngle = Math.PI * 0.92;
+// Dragging looks around from where you stand — nothing orbits. OrbitControls
+// still supplies damping and right-drag pan, but its pivot is pinned just
+// ahead of the camera so rotation reads as turning your head, and the wheel
+// walks the view forward instead of dollying onto a pivot.
+const LOOK_TARGET_DISTANCE = 0.6;
+controls.rotateSpeed = -0.45;
+controls.enableZoom = false;
+function seatLookTarget(): void {
+  const forward = controls.target.clone().sub(camera.position);
+  if (forward.lengthSq() < 1e-8) camera.getWorldDirection(forward);
+  else forward.normalize();
+  controls.target.copy(camera.position).addScaledVector(forward, LOOK_TARGET_DISTANCE);
+}
+controls.target.set(0, 0.78, 0);
+seatLookTarget();
 controls.update();
 
 const deskRaycaster = new THREE.Raycaster();
@@ -1109,14 +1124,19 @@ function deskPanelUnderPointer(event: WheelEvent): DeskStation | undefined {
 }
 
 renderer.domElement.addEventListener('wheel', event => {
-  const desk = deskPanelUnderPointer(event);
-  if (!desk) return;
   event.preventDefault();
   // OrbitControls owns a bubble-phase wheel listener on this same canvas.
   // Handle router input in capture phase and stop it here, otherwise the pane
-  // list scroll and the camera dolly happen from the same wheel gesture.
+  // list scroll and the camera move happen from the same wheel gesture.
   event.stopImmediatePropagation();
-  scrollDeskHud(desk, event.deltaY > 0 ? 1 : -1);
+  const desk = deskPanelUnderPointer(event);
+  if (desk) { scrollDeskHud(desk, event.deltaY > 0 ? 1 : -1); return; }
+  const forward = new THREE.Vector3();
+  camera.getWorldDirection(forward);
+  camera.position.addScaledVector(forward, -Math.sign(event.deltaY) * 0.9);
+  camera.position.y = Math.max(camera.position.y, 0.25);
+  seatLookTarget();
+  saveCamera();
 }, { passive: false, capture: true });
 
 addEventListener('keydown', event => {
@@ -1153,6 +1173,7 @@ function restoreCamera(): boolean {
       : undefined;
     deskViewId = typeof saved.deskViewId === 'string' ? saved.deskViewId : undefined;
     camera.position.fromArray(saved.position); controls.target.fromArray(saved.target); camera.zoom = saved.zoom || 1;
+    seatLookTarget();
     camera.updateProjectionMatrix(); controls.update(); return true;
   } catch { return false; }
 }
@@ -2800,7 +2821,7 @@ function frame(now: number): void {
     const eased = t * t * t * (t * (t * 6 - 15) + 10);
     camera.position.lerpVectors(cameraMove.fromPosition, cameraMove.toPosition, eased);
     controls.target.lerpVectors(cameraMove.fromTarget, cameraMove.toTarget, eased);
-    if (t === 1) { cameraMove = undefined; saveCamera(); }
+    if (t === 1) { cameraMove = undefined; seatLookTarget(); saveCamera(); }
   }
   controls.update();
   streamBroker.tick(camera);

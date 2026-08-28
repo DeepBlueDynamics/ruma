@@ -14,7 +14,6 @@ canvas { display: block; }
 .load-grid b { color: #bddbe6; font-weight: 500; text-align: right; letter-spacing: .02em; }
 #reset-view { position: fixed; z-index: 3; top: 54px; left: 16px; padding: 6px 9px; color: #52778b; background: rgb(3 8 14 / 78%); border: 1px solid rgb(43 155 213 / 28%); font: 9px/1.3 "Cascadia Mono", Consolas, monospace; letter-spacing: .12em; cursor: pointer; }
 #reset-view:hover { color: #c9efff; border-color: #42c8ff; }
-#app::after { content: "DRAG · ORBIT     WHEEL · ZOOM     RIGHT DRAG · PAN"; position: fixed; left: 16px; bottom: 16px; z-index: 2; color: #52778b; font: 10px/1.4 "Cascadia Mono", Consolas, monospace; letter-spacing: .12em; pointer-events: none; }
 
 #celestial-hud {
   position: fixed;
