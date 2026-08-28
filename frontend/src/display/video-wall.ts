@@ -3,6 +3,7 @@ import { cssColor, wallRowPayload, type Cell, type Color, type Cursor, type Grid
 import { hyperiaWsUrl, openContentSocket, type StreamSession } from '../hyperia/stream';
 import { TabStream } from '../hyperia/tab-stream';
 import { normalizeSectionSources, WALL_SECTION_COUNT, type SectionSource } from './section-source';
+import type { SpawnedDeskVariant } from '../state/spawned-desks';
 import type { DisplaySurface } from './surface';
 
 export type VideoWallPane = {
@@ -51,7 +52,7 @@ export type VideoWallTabGroup = {
 };
 
 export type VideoWallRouterRegion = {
-  kind: 'router-tab' | 'router-tab-expand' | 'router-pane' | 'router-scroll-up' | 'router-scroll-down' | 'router-close';
+  kind: 'router-tab' | 'router-tab-expand' | 'router-pane' | 'router-scroll-up' | 'router-scroll-down' | 'router-close' | 'router-add-desk';
   sectionIndex: number;
   x0: number;
   y0: number;
@@ -59,6 +60,8 @@ export type VideoWallRouterRegion = {
   y1: number;
   tabId?: string;
   paneId?: string;
+  /** Set on `router-add-desk` regions only. */
+  deskVariant?: SpawnedDeskVariant;
 };
 
 export type VideoWallResetRegion = {
@@ -152,13 +155,12 @@ function truncate(ctx: CanvasRenderingContext2D, value: string, width: number): 
 }
 
 /**
- * Presentation wall (the big screen). Selected Hyperia panes get a dedicated
+ * One room display (a wall arc). Selected Hyperia panes get a dedicated
  * stream: PTY → `/ws/pane/{id}` (binary seed + live bytes into xterm), web →
  * `/ws/pixels/{id}`. `/ws/wall` is the many-tiny-monitors overview path and is
- * not used to paint this surface.
+ * not used to paint these surfaces.
  */
 export class VideoWallController {
-  private static readonly sectionStorageKey = 'ops-room/room-display-2/sections-v1';
   private surface?: DisplaySurface;
   private readonly sectionSources: SectionSource[];
   private readonly views = new Map<string, PaneView>();
@@ -178,8 +180,17 @@ export class VideoWallController {
   private readonly routers = new Map<number, RouterState>();
   private renderQueued = false;
 
-  constructor() {
+  /**
+   * `displayIndex` names the physical wall arc (Wall_Screen_{1|2|3}) and keys
+   * this display's persisted section layout. Display 2 was the only display
+   * before all three went live, so its historic storage key is preserved.
+   */
+  constructor(readonly displayIndex: number) {
     this.sectionSources = this.restoreSectionSources();
+  }
+
+  private get sectionStorageKey(): string {
+    return `ops-room/room-display-${this.displayIndex}/sections-v1`;
   }
 
   attachSurface(surface: DisplaySurface): void {
@@ -295,6 +306,7 @@ export class VideoWallController {
     this.sectionSources[sectionIndex] = source;
     this.persistSectionSources();
     console.info('main-screen-source-assigned', {
+      displayIndex: this.displayIndex,
       sectionIndex: sectionIndex + 1,
       kind: source?.kind ?? 'none',
       sourceId: source?.kind === 'pane' ? source.paneId : source?.kind === 'tab' ? source.tabId : '',
@@ -572,9 +584,10 @@ export class VideoWallController {
       this.regions.push({ kind: 'pane', paneId: view.paneId, title: paneLabel(view), x0: x, y0: y, x1: x + sectionWidth, y1: y + sectionHeight });
     }
 
-    // Keep the requested room-reset capability on the physical display, but
-    // make it a small overlay inside the right section instead of a global UI.
-    if (this.openRouterIndex !== undefined) {
+    // Keep the requested room-reset capability on the physical room, but as a
+    // small overlay inside the main display's right section — never one per
+    // display, and never over an explicitly opened picker.
+    if (this.displayIndex !== 2 || this.openRouterIndex !== undefined) {
       this.resetRegion = undefined;
       texture.needsUpdate = true;
       return;
@@ -662,7 +675,8 @@ export class VideoWallController {
     const rowHeight = Math.max(48, 62 * scale);
     const rowGap = Math.max(5, 8 * scale);
     const listTop = rect.y + titleHeight + pad * .45;
-    const listBottom = rect.y + rect.height - pad;
+    const deskBarHeight = Math.max(46, 58 * scale);
+    const listBottom = rect.y + rect.height - pad - deskBarHeight - pad * .5;
     const listHeight = listBottom - listTop;
     const visibleRows = Math.max(3, Math.floor((listHeight + rowGap) / (rowHeight + rowGap)));
     const listWidth = rect.width - pad * 2 - railWidth - pad * .45;
@@ -718,6 +732,32 @@ export class VideoWallController {
       ctx.fillText('×', closeX + closeSize / 2, closeY + closeSize / 2);
       this.regions.push({ kind: 'router-close', sectionIndex, x0: closeX, y0: closeY, x1: closeX + closeSize, y1: closeY + closeSize });
     }
+
+    // ADD DESK: spawn an operator station on the floor in front of this
+    // display. Always available — a picker with no sources can still add
+    // furniture. Variants mirror the authored desk recipes.
+    const deskBarY = rect.y + rect.height - pad - deskBarHeight;
+    const deskBarWidth = rect.width - pad * 2;
+    const deskButtonGap = Math.max(6, 10 * scale);
+    const deskButtonWidth = (deskBarWidth - deskButtonGap * 2) / 3;
+    const deskVariants: Array<{ variant: SpawnedDeskVariant; label: string }> = [
+      { variant: '3-up', label: '+ DESK · 3 MON' },
+      { variant: 'curved+side', label: '+ DESK · CURVED' },
+      { variant: '4-up', label: '+ DESK · 4 MON' },
+    ];
+    ctx.textAlign = 'center';
+    deskVariants.forEach((entry, i) => {
+      const buttonX = rect.x + pad + i * (deskButtonWidth + deskButtonGap);
+      ctx.fillStyle = '#0a2b22';
+      ctx.fillRect(buttonX, deskBarY, deskButtonWidth, deskBarHeight);
+      ctx.strokeStyle = '#3ce49a';
+      ctx.lineWidth = Math.max(1, 2 * scale);
+      ctx.strokeRect(buttonX, deskBarY, deskButtonWidth, deskBarHeight);
+      ctx.fillStyle = '#b9f5dc';
+      ctx.font = `600 ${Math.max(12, Math.round(17 * scale))}px "Cascadia Mono", Consolas, monospace`;
+      ctx.fillText(truncate(ctx, entry.label, deskButtonWidth - 8), buttonX + deskButtonWidth / 2, deskBarY + deskBarHeight / 2);
+      this.regions.push({ kind: 'router-add-desk', sectionIndex, deskVariant: entry.variant, x0: buttonX, y0: deskBarY, x1: buttonX + deskButtonWidth, y1: deskBarY + deskBarHeight });
+    });
 
     if (!rows.length) {
       ctx.fillStyle = '#4e91a9';
@@ -815,13 +855,13 @@ export class VideoWallController {
 
   private restoreSectionSources(): SectionSource[] {
     try {
-      return normalizeSectionSources(JSON.parse(localStorage.getItem(VideoWallController.sectionStorageKey) ?? 'null'));
+      return normalizeSectionSources(JSON.parse(localStorage.getItem(this.sectionStorageKey) ?? 'null'));
     } catch { /* Ignore malformed legacy browser state. */ }
     return normalizeSectionSources(null);
   }
 
   private persistSectionSources(): void {
-    localStorage.setItem(VideoWallController.sectionStorageKey, JSON.stringify(this.sectionSources));
+    localStorage.setItem(this.sectionStorageKey, JSON.stringify(this.sectionSources));
   }
 
 

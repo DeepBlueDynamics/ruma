@@ -2,8 +2,10 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
 import { Terminal } from '@xterm/xterm';
-import { applyCylindricalUVs, createDisplaySurface, type DisplaySurface } from './display/surface';
+import { createDisplaySurface, type DisplaySurface } from './display/surface';
 import { buildStationLayout, sampleSurfaceNormalAtStation, yawFromSurfaceNormal } from './scene/layout';
+import { meshMiddleAzimuth, wallUnitFramingPose } from './scene/wall-unit';
+import { nextSpawnedDeskStationId, normalizeSpawnedDesks, SPAWNED_DESKS_KEY, spawnedDeskOrdinal, type SpawnedDeskRecord, type SpawnedDeskVariant } from './state/spawned-desks';
 import { recutFloorGrid } from './scene/floor-grid';
 import { removeRoomWallsAndCeiling } from './scene/room-cleanup';
 import { panoramicTheaterRoom } from './config/rooms/panoramic-theater';
@@ -232,7 +234,7 @@ class DeskStation {
   }
 }
 type DeskHudHitRegion = {
-  kind: 'monitor' | 'tab' | 'tab-connect' | 'pane' | 'scroll-up' | 'scroll-down';
+  kind: 'monitor' | 'tab' | 'tab-connect' | 'pane' | 'scroll-up' | 'scroll-down' | 'remove';
   x0: number;
   y0: number;
   x1: number;
@@ -244,6 +246,17 @@ type DeskHudHitRegion = {
 const desks = new Map<string, DeskStation>();
 const DESK_STORAGE_KEY = 'ops-room-selected-desk-v1';
 let selectedDeskId = localStorage.getItem(DESK_STORAGE_KEY) || 'operator-desk-1';
+
+// Operator-spawned desks. The registry is the durable truth; each record is
+// materialized into full station machinery (bays, HUD, broker leases) on boot
+// and on spawn, and torn down again by the HUD's ✕ affordance.
+let spawnedDesks: SpawnedDeskRecord[] = (() => {
+  try { return normalizeSpawnedDesks(JSON.parse(localStorage.getItem(SPAWNED_DESKS_KEY) ?? 'null')); }
+  catch { return []; }
+})();
+function persistSpawnedDesks(): void {
+  localStorage.setItem(SPAWNED_DESKS_KEY, JSON.stringify(spawnedDesks));
+}
 let monitorHold: { deskId: string; index: number; start: number; triggered: boolean } | undefined;
 const diagnostics = { appVersion: 'unknown', hyperiaVersion: 'offline', hyperiaOnline: false, gpu: 'unavailable', webgl: false };
 
@@ -268,10 +281,10 @@ function opsRoomSnapshot(): OpsRoomSnapshot {
     }
     return entry.targets;
   };
-  videoWall.sectionSourcesSnapshot().forEach((source, index) => {
+  for (const viewer of wallViewers) viewer.controller.sectionSourcesSnapshot().forEach((source, index) => {
     if (source) targetsFor(source).push({
       kind: 'room-display-section',
-      displayId: 'room-display-2',
+      displayId: `room-display-${viewer.controller.displayIndex}`,
       sectionId: `section-${index + 1}`,
     });
   });
@@ -491,11 +504,19 @@ function paintDirtyTabStreams(): void {
   dirtyTabStreams.clear();
 }
 
-const videoWall = new VideoWallController();
-// Topology only. The presentation wall paints from dedicated /ws/pane,
-// /ws/pixels and /ws/tab leases — not from this overview feed. All four wall
-// sections boot disconnected and paint their on-surface source picker until
-// the operator assigns a live pane or tab.
+// One viewer per wall arc. Every display is fed by dedicated /ws/pane,
+// /ws/pixels and /ws/tab leases — /ws/wall is topology only. All sections on
+// all three displays boot disconnected and paint their on-surface source
+// picker until the operator assigns a live pane or tab.
+type WallViewer = {
+  readonly controller: VideoWallController;
+  surface?: DisplaySurface;
+  mesh?: THREE.Mesh;
+};
+const wallViewers: WallViewer[] = [1, 2, 3].map(displayIndex => ({ controller: new VideoWallController(displayIndex) }));
+function wallViewerForMesh(object: THREE.Object3D): WallViewer | undefined {
+  return wallViewers.find(viewer => viewer.mesh === object);
+}
 streamBroker.onWallMessage(message => ingestWallTopology(message));
 
 function applyStationPlacement(desk: THREE.Object3D, id: string): void {
@@ -629,6 +650,7 @@ let focusedScreen: { deskId: string; monitorIndex: number } | undefined;
 let deskViewId: string | undefined;
 
 function beginCameraMove(toPosition: THREE.Vector3, toTarget: THREE.Vector3): void {
+  clearWallUnitFocus();
   const positionDistance = camera.position.distanceTo(toPosition);
   const targetDistance = controls.target.distanceTo(toTarget);
   // Scale duration with the actual move: close monitor/desk transitions stay
@@ -698,48 +720,6 @@ function resolveMonitorIndex(object: THREE.Object3D): number | undefined {
   return undefined;
 }
 
-// Measured interior of the authored shell, used to keep the operator inside the
-// building. OrbitControls only bounds distance from the target, which is a
-// sphere; the room is a cylinder, so a perfectly legal orbit distance can still
-// put the head through the ceiling or a wall.
-let roomInterior: { radius: number; floor: number; ceiling: number } | undefined;
-
-function captureRoomInterior(room: THREE.Object3D): void {
-  const shell = room.getObjectByName('Room_Enclosed_Circular_Shell');
-  if (!(shell instanceof THREE.Mesh)) return;
-  const position = shell.geometry.getAttribute('position');
-  let radius = Infinity;
-  const local = new THREE.Vector3();
-  for (let i = 0; i < position.count; i++) {
-    local.fromBufferAttribute(position, i).applyMatrix4(shell.matrixWorld);
-    radius = Math.min(radius, Math.hypot(local.x, local.z));
-  }
-  const bounds = new THREE.Box3().setFromObject(shell);
-  roomInterior = { radius, floor: bounds.min.y, ceiling: bounds.max.y };
-  // Distance still gets a sane cap so the wheel does not spend itself pushing
-  // against the clamp, but the clamp is what actually holds the boundary.
-  controls.maxDistance = Math.min(controls.maxDistance, radius * 1.6);
-}
-
-// Push the camera back inside the shell. Runs after controls.update(), which
-// re-derives its orbit from camera.position each frame, so a clamped position
-// is carried forward and the boundary behaves like a wall rather than a rubber
-// band.
-function containCamera(): void {
-  if (!roomInterior) return;
-  const margin = .6;
-  const limit = Math.max(.5, roomInterior.radius - margin);
-  const flat = Math.hypot(camera.position.x, camera.position.z);
-  if (flat > limit) {
-    const scale = limit / flat;
-    camera.position.x *= scale;
-    camera.position.z *= scale;
-  }
-  camera.position.y = Math.min(
-    Math.max(camera.position.y, roomInterior.floor + .4),
-    roomInterior.ceiling - margin,
-  );
-}
 
 function focusRoom(): void {
   focusedScreen = undefined; deskViewId = undefined;
@@ -851,6 +831,15 @@ function drawDeskHud(id: string): void {
       ctx.textAlign = 'center'; ctx.fillText(String(monitor), x + tabWidth / 2, 60); ctx.textAlign = 'left';
       hitRegions.push({ kind: 'monitor', x0: x, y0: 30, x1: x + tabWidth, y1: 30 + tabHeight, index: monitor });
   }
+  // Spawned desks carry their teardown affordance on their own HUD.
+  if (spawnedDesks.some(record => record.stationId === id)) {
+    const removeX = selectorStart - 58;
+    ctx.fillStyle = '#2a070c'; ctx.fillRect(removeX, 30, 44, 44);
+    ctx.strokeStyle = '#ff5864'; ctx.lineWidth = 3; ctx.strokeRect(removeX, 30, 44, 44);
+    ctx.fillStyle = '#ffb3ba'; ctx.font = 'bold 24px Cascadia Mono, monospace'; ctx.textAlign = 'center';
+    ctx.fillText('✕', removeX + 22, 60); ctx.textAlign = 'left';
+    hitRegions.push({ kind: 'remove', x0: removeX, y0: 30, x1: removeX + 44, y1: 74 });
+  }
   const deskTarget = desk.monitorTargets[desk.selectedMonitor - 1];
   const rows: Array<
     | { kind: 'tab'; tab: TabGroup }
@@ -947,7 +936,7 @@ void refreshDiagnostics(); setInterval(refreshDiagnostics, 3000);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x05080d);
-const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.01, 120);
+const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.01, 1200);
 camera.position.set(1.35, 1.15, 2.35);
 camera.lookAt(0, 0.78, 0);
 const controls = new OrbitControls(camera, renderer.domElement);
@@ -1006,9 +995,18 @@ renderer.domElement.addEventListener('pointerup', event => {
     typeof resolveMonitorIndex(candidate.object) === 'number'
     && candidate.distance - (nearest?.distance ?? 0) <= MONITOR_PICK_TOLERANCE);
   const hit = preferred ?? nearest;
-  if (!hit && wallDisplay) {
-    const wallHit = deskRaycaster.intersectObject(wallDisplay.mesh, false)[0];
-    if (wallHit && !floorOccludes(wallHit.distance)) routeWallPointer(wallHit);
+  if (!hit && wallPointerTargets.length) {
+    const wallHit = deskRaycaster.intersectObjects(wallPointerTargets, false)[0];
+    if (!wallHit || floorOccludes(wallHit.distance)) return;
+    // Bezel (frame / light rail) clicks toggle the whole-wall framing move;
+    // glass clicks route through the display's canvas regions.
+    if (wallHit.object.userData.wallBezel === true) {
+      cancelPendingWallClick();
+      toggleWallUnitFocus();
+      return;
+    }
+    const viewer = wallViewerForMesh(wallHit.object);
+    if (viewer) routeWallPointer(viewer, wallHit);
     return;
   }
   if (!hit) return;
@@ -1056,32 +1054,34 @@ renderer.domElement.addEventListener('pointerup', event => {
     }
     if (region?.kind === 'scroll-up') scrollDeskHud(desk, -1);
     if (region?.kind === 'scroll-down') scrollDeskHud(desk, 1);
+    if (region?.kind === 'remove') removeSpawnedDesk(desk.id);
   }
   else selectDesk(deskId);
 });
 renderer.domElement.addEventListener('pointercancel', () => { monitorHold = undefined; cancelPendingWallClick(); drawAllDeskHuds(); });
 renderer.domElement.addEventListener('dblclick', event => {
-  if (!wallDisplay) return;
+  if (!wallScreenMeshes.length) return;
   deskPointer.set(event.clientX / innerWidth * 2 - 1, -(event.clientY / innerHeight) * 2 + 1);
   deskRaycaster.setFromCamera(deskPointer, camera);
-  const wallHit = deskRaycaster.intersectObject(wallDisplay.mesh, false)[0];
-  if (!wallHit?.uv) return;
+  const wallHit = deskRaycaster.intersectObjects(wallScreenMeshes, false)[0];
+  const viewer = wallHit ? wallViewerForMesh(wallHit.object) : undefined;
+  if (!wallHit?.uv || !viewer?.surface) return;
   if (floorOccludes(wallHit.distance)) return;
   const deskHit = deskRaycaster.intersectObjects([...desks.values()].map(desk => desk.object), true)[0];
   if (deskHit && deskHit.distance <= wallHit.distance + MONITOR_PICK_TOLERANCE) return;
-  const px = wallHit.uv.x * wallDisplay.canvas.width;
-  const py = (1 - wallHit.uv.y) * wallDisplay.canvas.height;
-  const sectionIndex = videoWall.sectionIndexAt(px, py);
+  const px = wallHit.uv.x * viewer.surface.canvas.width;
+  const py = (1 - wallHit.uv.y) * viewer.surface.canvas.height;
+  const sectionIndex = viewer.controller.sectionIndexAt(px, py);
   if (sectionIndex === undefined) return;
   event.preventDefault();
   cancelPendingWallClick();
-  videoWall.openSectionRouter(sectionIndex);
-  wallZoomedContentId = undefined;
-  videoWall.setFocusedPane(undefined);
-  const focusRegion = wallSectionFocusRegion(sectionIndex);
-  if (focusRegion) focusWallRegion(focusRegion);
-  console.info('main-screen-source-picker-opened', { sectionIndex: sectionIndex + 1, input: 'dblclick' });
-  status.textContent = `MAIN SCREEN · SECTION ${sectionIndex + 1} SOURCE PICKER`;
+  viewer.controller.openSectionRouter(sectionIndex);
+  wallZoom = undefined;
+  viewer.controller.setFocusedPane(undefined);
+  const focusRegion = wallSectionFocusRegion(viewer, sectionIndex);
+  if (focusRegion) focusWallRegion(viewer, focusRegion);
+  console.info('main-screen-source-picker-opened', { displayIndex: viewer.controller.displayIndex, sectionIndex: sectionIndex + 1, input: 'dblclick' });
+  status.textContent = `DISPLAY ${viewer.controller.displayIndex} · SECTION ${sectionIndex + 1} SOURCE PICKER`;
 });
 
 function scrollDeskHud(desk: DeskStation, amount: number): void {
@@ -1163,8 +1163,9 @@ const floor = new THREE.Mesh(
 floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true; scene.add(floor);
 
 function resetRoom(): void {
-  monitorHold = undefined; focusedScreen = undefined; deskViewId = undefined; wallZoomedContentId = undefined;
-  videoWall.setFocusedPane(undefined);
+  monitorHold = undefined; focusedScreen = undefined; deskViewId = undefined; wallZoom = undefined;
+  clearWallUnitFocus();
+  for (const viewer of wallViewers) viewer.controller.setFocusedPane(undefined);
   desks.forEach(desk => desk.reset());
   selectedDeskId = 'operator-desk-1'; localStorage.setItem(DESK_STORAGE_KEY, selectedDeskId);
   localStorage.removeItem(CAMERA_STORAGE_KEY);
@@ -1173,15 +1174,83 @@ function resetRoom(): void {
 }
 
 // Wall arcs and desk monitors share DisplaySurface geometry, but never content
-// state. The video wall is fed directly by /ws/wall and owns no desk session.
-let wallDisplay: DisplaySurface | undefined;
+// state. Populated once the room shell resolves; bezels (frames + light rails)
+// are pointer targets for the whole-wall framing toggle.
+const wallScreenMeshes: THREE.Mesh[] = [];
+const wallBezelMeshes: THREE.Mesh[] = [];
+let wallPointerTargets: THREE.Object3D[] = [];
 
-function focusPresentationScreen(): void {
-  if (!presentationSurface) return;
+const WALL_UNIT_FOV_DEG = 38;
+
+// Snapshot of the operator's camera before the wall-unit framing move, so a
+// second bezel click restores exactly where they were. Any other camera move
+// abandons the framing and returns the orbit limits it borrowed.
+let wallUnitReturn: {
+  position: THREE.Vector3;
+  target: THREE.Vector3;
+  fov: number;
+  minDistance: number;
+  maxDistance: number;
+  zoomSpeed: number;
+} | undefined;
+
+function clearWallUnitFocus(): void {
+  if (!wallUnitReturn) return;
+  controls.maxDistance = wallUnitReturn.maxDistance;
+  wallUnitReturn = undefined;
+}
+
+/**
+ * Bezel click: frame the ENTIRE three-screen wall unit. The pose sits on the
+ * unit's angular bisector (the presentation arc's middle azimuth — screens 1
+ * and 3 are symmetric about it) at the minimum standoff that fits all three
+ * screens' world bounds inside the 38° vertical / aspect-derived horizontal
+ * FOV. A second bezel click restores the pre-focus camera.
+ */
+function toggleWallUnitFocus(): void {
+  if (wallUnitReturn) {
+    const previous = wallUnitReturn;
+    wallUnitReturn = undefined;
+    camera.fov = previous.fov; camera.updateProjectionMatrix();
+    controls.minDistance = previous.minDistance;
+    controls.maxDistance = previous.maxDistance;
+    controls.zoomSpeed = previous.zoomSpeed;
+    beginCameraMove(previous.position, previous.target);
+    status.textContent = 'WALL FOCUS RELEASED';
+    return;
+  }
+  const anchor = presentationSurface ?? wallScreenMeshes[0];
+  if (!anchor || !wallScreenMeshes.length) return;
+  const boxes = wallScreenMeshes.map(mesh => new THREE.Box3().setFromObject(mesh));
+  const pose = wallUnitFramingPose(boxes, meshMiddleAzimuth(anchor), WALL_UNIT_FOV_DEG, camera.aspect);
+  if (!pose) return;
+  const snapshot = {
+    position: camera.position.clone(),
+    target: controls.target.clone(),
+    fov: camera.fov,
+    minDistance: controls.minDistance,
+    maxDistance: controls.maxDistance,
+    zoomSpeed: controls.zoomSpeed,
+  };
+  focusedScreen = undefined; deskViewId = undefined; wallZoom = undefined;
+  for (const viewer of wallViewers) viewer.controller.setFocusedPane(undefined);
+  camera.fov = WALL_UNIT_FOV_DEG; camera.updateProjectionMatrix();
+  controls.minDistance = .65;
+  controls.zoomSpeed = 1;
+  // OrbitControls clamps radius every update; without this the framing pose
+  // would be dragged back inside the old orbit limit and fight the tween.
+  controls.maxDistance = Math.max(snapshot.maxDistance, pose.distance * 1.1);
+  beginCameraMove(pose.position, pose.target);
+  wallUnitReturn = snapshot;
+  status.textContent = 'WALL UNIT FOCUS';
+}
+
+function focusWallScreen(viewer: WallViewer): void {
+  if (!viewer.mesh) return;
   focusedScreen = undefined; deskViewId = undefined;
-  wallZoomedContentId = undefined;
-  videoWall.setFocusedPane(undefined);
-  const bounds = new THREE.Box3().setFromObject(presentationSurface);
+  wallZoom = undefined;
+  viewer.controller.setFocusedPane(undefined);
+  const bounds = new THREE.Box3().setFromObject(viewer.mesh);
   const center = bounds.getCenter(new THREE.Vector3());
   // The arc is concentric with the room axis, so its own centre of curvature is
   // the only spot that sees the whole span without foreshortening. Sit just
@@ -1193,19 +1262,19 @@ function focusPresentationScreen(): void {
   controls.minDistance = .4; controls.zoomSpeed = 1.1;
   camera.fov = 52; camera.updateProjectionMatrix();
   beginCameraMove(position, center);
-  status.textContent = 'MAIN SCREEN';
+  status.textContent = viewer.controller.displayIndex === 2 ? 'MAIN SCREEN' : `ROOM DISPLAY ${viewer.controller.displayIndex}`;
 }
 
 // Selecting any content section moves the operator camera to that physical
-// portion of the arc; selecting it again returns to the complete wall.
-let wallZoomedContentId: string | undefined;
+// portion of the arc; selecting it again returns to the complete display.
+let wallZoom: { displayIndex: number; contentId: string } | undefined;
 
 /** The camera framing only needs a titled canvas rect, not a full region. */
 type WallFocusRect = { title: string; x0: number; y0: number; x1: number; y1: number };
 
-function pointOnWallRegion(region: WallFocusRect): THREE.Vector3 | undefined {
-  if (!wallDisplay) return;
-  const mesh = wallDisplay.mesh;
+function pointOnWallRegion(viewer: WallViewer, region: WallFocusRect): THREE.Vector3 | undefined {
+  if (!viewer.mesh || !viewer.surface) return;
+  const mesh = viewer.mesh;
   const position = mesh.geometry.getAttribute('position');
   if (!position?.count) return;
 
@@ -1223,8 +1292,8 @@ function pointOnWallRegion(region: WallFocusRect): THREE.Vector3 | undefined {
     minOffset = Math.min(minOffset, offset); maxOffset = Math.max(maxOffset, offset);
   }
 
-  const u = ((region.x0 + region.x1) / 2) / wallDisplay.canvas.width;
-  const v = 1 - ((region.y0 + region.y1) / 2) / wallDisplay.canvas.height;
+  const u = ((region.x0 + region.x1) / 2) / viewer.surface.canvas.width;
+  const v = 1 - ((region.y0 + region.y1) / 2) / viewer.surface.canvas.height;
   const angle = middle + minOffset + (maxOffset - minOffset) * u;
   const localRadius = radius / position.count;
   const local = new THREE.Vector3(
@@ -1235,14 +1304,15 @@ function pointOnWallRegion(region: WallFocusRect): THREE.Vector3 | undefined {
   return mesh.localToWorld(local);
 }
 
-function focusWallRegion(region: WallFocusRect): void {
-  if (!wallDisplay) return;
-  const target = pointOnWallRegion(region);
+function focusWallRegion(viewer: WallViewer, region: WallFocusRect): void {
+  const surface = viewer.surface;
+  if (!surface || !viewer.mesh) return;
+  const target = pointOnWallRegion(viewer, region);
   if (!target) return;
-  const bounds = new THREE.Box3().setFromObject(wallDisplay.mesh);
+  const bounds = new THREE.Box3().setFromObject(viewer.mesh);
   const wallHeight = bounds.getSize(new THREE.Vector3()).y;
-  const regionHeight = wallHeight * (region.y1 - region.y0) / wallDisplay.canvas.height;
-  const regionWidth = wallHeight * wallDisplay.panelAspect * (region.x1 - region.x0) / wallDisplay.canvas.width;
+  const regionHeight = wallHeight * (region.y1 - region.y0) / surface.canvas.height;
+  const regionWidth = wallHeight * surface.panelAspect * (region.x1 - region.x0) / surface.canvas.width;
   const verticalFov = THREE.MathUtils.degToRad(42);
   const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * camera.aspect);
   const standoff = Math.max(
@@ -1257,12 +1327,12 @@ function focusWallRegion(region: WallFocusRect): void {
   status.textContent = `${region.title.toUpperCase()} · WALL DETAIL`;
 }
 
-function wallSectionFocusRegion(sectionIndex: number): WallFocusRect | undefined {
-  if (!wallDisplay || sectionIndex < 0 || sectionIndex > 3) return;
-  const { canvas } = wallDisplay;
+function wallSectionFocusRegion(viewer: WallViewer, sectionIndex: number): WallFocusRect | undefined {
+  if (!viewer.surface || sectionIndex < 0 || sectionIndex > 3) return;
+  const { canvas } = viewer.surface;
   const sectionWidth = canvas.width / 4;
   return {
-    title: `Main Screen Section ${sectionIndex + 1}`,
+    title: `Display ${viewer.controller.displayIndex} Section ${sectionIndex + 1}`,
     x0: sectionIndex * sectionWidth,
     y0: 0,
     x1: (sectionIndex + 1) * sectionWidth,
@@ -1278,18 +1348,23 @@ function isWallRouterRegion(region: VideoWallRegion | undefined): region is Vide
     || region.kind === 'router-scroll-up'
     || region.kind === 'router-scroll-down'
     || region.kind === 'router-close'
+    || region.kind === 'router-add-desk'
   );
 }
 
-function handleWallClick(hit: THREE.Intersection): void {
-  if (!wallDisplay || !hit.uv) return;
-  const { canvas } = wallDisplay;
-  const px = hit.uv.x * canvas.width;
-  const py = (1 - hit.uv.y) * canvas.height;
-  const region = videoWall.hitTest(px, py);
+function handleWallClick(viewer: WallViewer, hit: THREE.Intersection): void {
+  const surface = viewer.surface;
+  if (!surface || !hit.uv) return;
+  const px = hit.uv.x * surface.canvas.width;
+  const py = (1 - hit.uv.y) * surface.canvas.height;
+  const region = viewer.controller.hitTest(px, py);
+  if (region?.kind === 'router-add-desk' && region.deskVariant) {
+    void spawnDeskForDisplay(viewer.controller.displayIndex, region.deskVariant);
+    return;
+  }
   if (isWallRouterRegion(region)) {
-    videoWall.activateRouterRegion(region);
-    status.textContent = `MAIN SCREEN · SECTION ${region.sectionIndex + 1}`;
+    viewer.controller.activateRouterRegion(region);
+    status.textContent = `DISPLAY ${viewer.controller.displayIndex} · SECTION ${region.sectionIndex + 1}`;
     return;
   }
   if (region?.kind === 'reset') {
@@ -1297,21 +1372,21 @@ function handleWallClick(hit: THREE.Intersection): void {
     return;
   }
   if (!region || (region.kind !== 'pane' && region.kind !== 'tab')) {
-    focusPresentationScreen();
+    focusWallScreen(viewer);
     return;
   }
   const contentId = region.kind === 'pane' ? `pane:${region.paneId}` : `tab:${region.tabId}`;
-  if (wallZoomedContentId === contentId) {
-    focusPresentationScreen();
+  if (wallZoom?.displayIndex === viewer.controller.displayIndex && wallZoom.contentId === contentId) {
+    focusWallScreen(viewer);
     return;
   }
-  wallZoomedContentId = contentId;
-  videoWall.setFocusedPane(region.kind === 'pane' ? region.paneId : undefined);
-  focusWallRegion(region);
+  wallZoom = { displayIndex: viewer.controller.displayIndex, contentId };
+  viewer.controller.setFocusedPane(region.kind === 'pane' ? region.paneId : undefined);
+  focusWallRegion(viewer, region);
 }
 
 const WALL_DOUBLE_CLICK_MS = 420;
-let pendingWallClick: { hit: THREE.Intersection; sectionIndex: number; at: number; timer: number } | undefined;
+let pendingWallClick: { viewer: WallViewer; hit: THREE.Intersection; sectionIndex: number; at: number; timer: number } | undefined;
 
 function cancelPendingWallClick(): void {
   if (!pendingWallClick) return;
@@ -1319,44 +1394,45 @@ function cancelPendingWallClick(): void {
   pendingWallClick = undefined;
 }
 
-function routeWallPointer(hit: THREE.Intersection): void {
-  if (!wallDisplay || !hit.uv) return;
-  const px = hit.uv.x * wallDisplay.canvas.width;
-  const py = (1 - hit.uv.y) * wallDisplay.canvas.height;
-  const region = videoWall.hitTest(px, py);
+function routeWallPointer(viewer: WallViewer, hit: THREE.Intersection): void {
+  const surface = viewer.surface;
+  if (!surface || !hit.uv) return;
+  const px = hit.uv.x * surface.canvas.width;
+  const py = (1 - hit.uv.y) * surface.canvas.height;
+  const region = viewer.controller.hitTest(px, py);
   // Picker controls — permanent on disconnected sections, reopened on
   // assigned ones — behave like desk-HUD controls: one click dispatches
   // immediately and never moves the camera.
   if (isWallRouterRegion(region) || region?.kind === 'reset') {
     cancelPendingWallClick();
-    handleWallClick(hit);
+    handleWallClick(viewer, hit);
     return;
   }
-  const sectionIndex = videoWall.sectionIndexAt(px, py);
+  const sectionIndex = viewer.controller.sectionIndexAt(px, py);
   if (sectionIndex === undefined) return;
   const now = performance.now();
-  if (pendingWallClick && pendingWallClick.sectionIndex === sectionIndex && now - pendingWallClick.at <= WALL_DOUBLE_CLICK_MS) {
+  if (pendingWallClick && pendingWallClick.viewer === viewer && pendingWallClick.sectionIndex === sectionIndex && now - pendingWallClick.at <= WALL_DOUBLE_CLICK_MS) {
     cancelPendingWallClick();
-    videoWall.openSectionRouter(sectionIndex);
-    wallZoomedContentId = undefined;
-    videoWall.setFocusedPane(undefined);
-    const focusRegion = wallSectionFocusRegion(sectionIndex);
-    if (focusRegion) focusWallRegion(focusRegion);
-    console.info('main-screen-source-picker-opened', { sectionIndex: sectionIndex + 1, input: 'pointer-pair' });
-    status.textContent = `MAIN SCREEN · SECTION ${sectionIndex + 1} SOURCE PICKER`;
+    viewer.controller.openSectionRouter(sectionIndex);
+    wallZoom = undefined;
+    viewer.controller.setFocusedPane(undefined);
+    const focusRegion = wallSectionFocusRegion(viewer, sectionIndex);
+    if (focusRegion) focusWallRegion(viewer, focusRegion);
+    console.info('main-screen-source-picker-opened', { displayIndex: viewer.controller.displayIndex, sectionIndex: sectionIndex + 1, input: 'pointer-pair' });
+    status.textContent = `DISPLAY ${viewer.controller.displayIndex} · SECTION ${sectionIndex + 1} SOURCE PICKER`;
     return;
   }
   if (pendingWallClick) {
-    const previous = pendingWallClick.hit;
+    const previous = pendingWallClick;
     cancelPendingWallClick();
-    handleWallClick(previous);
+    handleWallClick(previous.viewer, previous.hit);
   }
   const timer = window.setTimeout(() => {
     const queued = pendingWallClick;
     pendingWallClick = undefined;
-    if (queued) handleWallClick(queued.hit);
+    if (queued) handleWallClick(queued.viewer, queued.hit);
   }, WALL_DOUBLE_CLICK_MS);
-  pendingWallClick = { hit, sectionIndex, at: now, timer };
+  pendingWallClick = { viewer, hit, sectionIndex, at: now, timer };
 }
 
 // Full command-room shell and its architectural lighting initialized via RoomLoader.
@@ -1386,6 +1462,8 @@ roomLoader.loadRoom({
         metalness: style.metalness,
         toneMapped: false,
       });
+      node.userData.wallBezel = true;
+      wallBezelMeshes.push(node);
     }
     if (role === 'screen.lightRail') {
       node.material = new THREE.MeshStandardMaterial({
@@ -1396,28 +1474,29 @@ roomLoader.loadRoom({
         metalness: 0,
         toneMapped: false,
       });
+      node.userData.wallBezel = true;
+      wallBezelMeshes.push(node);
     }
   });
 
-  // All three arcs get real UVs; the centre arc is the room's main display and
-  // the flanking pair stay dark until content is assigned to them.
-  for (const name of ['Wall_Screen_1', 'Wall_Screen_2', 'Wall_Screen_3']) {
+  // All three arcs are live displays: real UVs, a canvas-backed surface, and
+  // a per-display controller with four disconnected sections.
+  ['Wall_Screen_1', 'Wall_Screen_2', 'Wall_Screen_3'].forEach((name, index) => {
     const wallScreen = room.getObjectByName(name);
-    if (!(wallScreen instanceof THREE.Mesh)) continue;
-    if (name !== 'Wall_Screen_2') {
-      applyCylindricalUVs(wallScreen);
-      wallScreen.material = new THREE.MeshBasicMaterial({ color: 0x061017, side: THREE.DoubleSide, toneMapped: false });
-      continue;
-    }
-    wallDisplay = createDisplaySurface(wallScreen, {
+    if (!(wallScreen instanceof THREE.Mesh)) return;
+    const viewer = wallViewers[index];
+    viewer.mesh = wallScreen;
+    viewer.surface = createDisplaySurface(wallScreen, {
       id: name,
       mapping: 'cylindrical',
       canvasHeight: 900,
       source: { kind: 'wall-status' },
     });
-    videoWall.attachSurface(wallDisplay);
-    presentationSurface = wallScreen;
-  }
+    viewer.controller.attachSurface(viewer.surface);
+    wallScreenMeshes.push(wallScreen);
+    if (name === panoramicTheaterRoom.presentationScreen) presentationSurface = wallScreen;
+  });
+  wallPointerTargets = [...wallScreenMeshes, ...wallBezelMeshes];
   recutFloorGrid(room, { sectors: panoramicTheaterRoom.floor.sectors });
   floorPickables = [];
   room.traverse(node => {
@@ -1432,8 +1511,10 @@ roomLoader.loadRoom({
   floor.visible = false;
   scene.add(room);
   room.updateWorldMatrix(true, true);
-  captureRoomInterior(room);
   alignStationsToPresentationSurface();
+  // Materialize operator-spawned desks now that the wall meshes exist to give
+  // each one its facing angle.
+  for (const record of spawnedDesks) void materializeSpawnedDesk(record);
   if (!restoreCamera()) { setOverviewCamera(); saveCamera(); }
 
   // The MASTER RESET placard used to float in front of the presentation wall.
@@ -1793,10 +1874,11 @@ AssetCache.getInstance().instantiate('/assets/standing_desk_sim_master.glb').the
     if (assemblyMatch) tagMonitorHierarchy(node, Number(assemblyMatch[1]) - 1);
     if (!(node instanceof THREE.Mesh)) return;
     node.castShadow = true; node.receiveShadow = true;
-    const monitorMatch = node.name.match(/_(2|3)$/);
-    if (monitorMatch && !node.name.startsWith('MonScreen_')) {
-      // The desk-1 shells always rendered faceted: the FX toggle lived in the
-      // retired DOM picker and was unreachable. Keep the look, drop the knob.
+    if (/^MonPanel_[23]$/.test(node.name)) {
+      // The desk-1 monitor housings always rendered faceted: the FX toggle
+      // lived in the retired DOM picker and was unreachable. Keep the look on
+      // the shells only — a faceted STAND catches the cyan room wash and
+      // reads as a blue glow, so bases/necks/sleeves stay smooth.
       const material = node.material as THREE.MeshStandardMaterial;
       material.flatShading = true;
       material.needsUpdate = true;
@@ -1831,16 +1913,18 @@ AssetCache.getInstance().instantiate('/assets/standing_desk_sim_master.glb').the
   bounds = new THREE.Box3().setFromObject(monitor);
   const framedCenter = bounds.getCenter(new THREE.Vector3());
   const size = bounds.getSize(new THREE.Vector3());
-  const radius = Math.max(size.x, size.y, size.z);
   const station = registerDesk('operator-desk-1', 'Operator Desk 1', monitor, panoramicTheaterRoom.stationBays['operator-desk-1']);
   applyStationPlacement(monitor, 'operator-desk-1');
   refreshDeskView(station);
   station.sessions.push(...Array.from({ length: station.monitorCount }, createMonitorSession));
+  // Wire the GLASS only. tagMonitorHierarchy marks the whole assembly with
+  // monitorIndex for click ownership; binding every marked mesh wrapped the
+  // session canvas around bases, necks and housings — a powered picker
+  // rendered as a blue-tinted stand.
   monitor.traverse(node => {
-    if (!(node instanceof THREE.Mesh)) return;
-    const bay = Number(node.userData.monitorIndex);
-    if (!Number.isInteger(bay) || bay < 1 || bay > station.monitorCount) return;
-    wireMonitorBay(station, bay, node);
+    const match = node.name.match(/^MonScreen_([23])$/);
+    if (!(node instanceof THREE.Mesh) || !match) return;
+    wireMonitorBay(station, Number(match[1]) - 1, node);
   });
   activateStationBays(station);
   scene.add(monitor);
@@ -1851,8 +1935,8 @@ AssetCache.getInstance().instantiate('/assets/standing_desk_sim_master.glb').the
   controls.target.copy(overview.target);
   camera.position.copy(overview.position);
   camera.fov = 46;
-  camera.near = Math.max(0.01, radius / 100);
-  camera.far = radius * 30;
+  // near/far are global camera policy (set at construction; far covers the
+  // celestial dome) — never derived from one desk's bounding radius.
   camera.updateProjectionMatrix();
   controls.minDistance = .65;
   controls.maxDistance = 42;
@@ -1884,19 +1968,29 @@ AssetCache.getInstance().instantiate('/assets/standing_desk_sim_master.glb').the
         }
         return modes;
       },
-      videoWall,
+      wallViewers,
+      get spawnedDesks() { return spawnedDesks; },
+      spawnDesk: (display: number, variant: SpawnedDeskVariant) => spawnDeskForDisplay(display, variant),
+      removeSpawnedDesk,
+      toggleWallUnitFocus,
+      setMonitorPower: (deskId: string, index: number, powered: boolean) => {
+        const target = desks.get(deskId);
+        if (target) setMonitorPower(target, index, powered);
+      },
       get discoveredTabs() { return discoveredTabs; },
       get discoveredPanes() { return discoveredPanes; },
       tabStreams,
       focusWallPane: (paneId: string) => {
-        const region = videoWall.regionForPane(paneId);
-        if (region) {
-          wallZoomedContentId = `pane:${paneId}`;
-          videoWall.setFocusedPane(paneId);
-          focusWallRegion(region);
+        for (const viewer of wallViewers) {
+          const region = viewer.controller.regionForPane(paneId);
+          if (!region) continue;
+          wallZoom = { displayIndex: viewer.controller.displayIndex, contentId: `pane:${paneId}` };
+          viewer.controller.setFocusedPane(paneId);
+          focusWallRegion(viewer, region);
+          return;
         }
       },
-      showWallOverview: focusPresentationScreen,
+      showWallOverview: () => focusWallScreen(wallViewers[1]),
     },
   });
   status.textContent = foundScreen ? 'DUAL DESK READY · CONNECTING HYPERIA' : 'SCREEN MESH NOT FOUND';
@@ -1973,61 +2067,17 @@ AssetCache.getInstance().instantiate('/assets/standing_desk_sim_master.glb').the
   station.sessions.push(...Array.from({ length: station.monitorCount }, createMonitorSession));
   activateStationBays(station);
   scene.add(desk);
-  let top: THREE.Object3D | undefined;
-  desk.traverse(node => { if (node.name === 'Desk_Wood_Top') top = node; });
   // Capture placement anchors in desk-local coordinates before either the room
   // or the asynchronously loaded displays can move. World-space snapshots here
   // caused the desk to reach its station first and the two displays to arrive
   // later at the room origin, leaving an empty desktop on the far right.
-  const topLocalBounds = boundsInObjectSpace(top ?? desk, desk);
-  const deskLocalCenter = boundsInObjectSpace(desk, desk).getCenter(new THREE.Vector3());
-  const addDisplay = (display: THREE.Object3D, index: number, targetWidth: number, xOffset: number) => {
-    openMonitorHousingFronts(display);
-    display.traverse(node => {
-      node.userData.deskId = station.id;
-      node.userData.monitorIndex = index;
-      if (node instanceof THREE.Mesh) { node.castShadow = true; node.receiveShadow = true; }
-    });
-    display.updateMatrixWorld(true);
-    const initial = new THREE.Box3().setFromObject(display);
-    display.scale.multiplyScalar(targetWidth / initial.getSize(new THREE.Vector3()).x);
-    display.updateMatrixWorld(true);
-    const desiredLocal = new THREE.Vector3(
-      deskLocalCenter.x + xOffset,
-      topLocalBounds.max.y + .015,
-      deskLocalCenter.z - .12,
-    );
-    // The custom right-desk displays must live below the same authored height
-    // pivot as the stock assemblies. Convert the desk-local placement into
-    // pivot space so later height changes carry the top, HUD and both monitors
-    // together without altering their horizontal station placement.
-    const desiredInPivot = station.heightPivot.worldToLocal(desk.localToWorld(desiredLocal));
-    station.heightPivot.add(display);
-    const localBounds = boundsInObjectSpace(display, station.heightPivot);
-    const localBottomCenter = localBounds.getCenter(new THREE.Vector3());
-    localBottomCenter.y = localBounds.min.y;
-    display.position.add(desiredInPivot.sub(localBottomCenter));
-    display.updateWorldMatrix(true, true);
-    let screen: THREE.Mesh | undefined;
-    display.traverse(node => {
-      if (!(node instanceof THREE.Mesh)) return;
-      if (node.name === 'CurvedMon_Screen' || node.name === 'Monitor_ScreenFace' || /Screen/i.test(node.name)) {
-        screen = node;
-      }
-    });
-    if (screen) {
-      screen.userData.deskId = station.id; screen.userData.monitorIndex = index;
-      wireMonitorBay(station, index, screen);
-      refreshSessionRaster(station.sessions[index - 1], station, index);
-      streamBroker.notifyChanged(screenLeaseId(station.id, index));
-    }
-  };
+  const anchors = captureDeskAnchors(desk);
   Promise.all([
     AssetCache.getInstance().instantiate('/assets/curved_monitor_ultrawide.glb'),
     AssetCache.getInstance().instantiate('/assets/monitor_black.glb'),
   ]).then(([curved, small]) => {
-    addDisplay(curved, 1, 1.55, -.36);
-    addDisplay(small, 2, .66, .88);
+    attachAuxDisplay(station, desk, anchors, curved, 1, 1.55, -.36);
+    attachAuxDisplay(station, desk, anchors, small, 2, .66, .88);
     applyStationPlacement(desk, 'operator-desk-3');
     refreshDeskView(station);
     console.info('right-desk-displays-attached', {
@@ -2044,7 +2094,245 @@ AssetCache.getInstance().instantiate('/assets/standing_desk_sim_master.glb').the
   pool.position.set(5.2, 6.5, .4); pool.target.position.set(5.2, 1, 0); scene.add(pool, pool.target);
 });
 
+// ---------------------------------------------------------------------------
+// Aux display attachment (desk-3 recipe) and operator-spawned desks.
+
+type DeskAnchors = { topLocalBounds: THREE.Box3; deskLocalCenter: THREE.Vector3 };
+
+function captureDeskAnchors(desk: THREE.Object3D): DeskAnchors {
+  let top: THREE.Object3D | undefined;
+  desk.traverse(node => { if (node.name === 'Desk_Wood_Top') top = node; });
+  return {
+    topLocalBounds: boundsInObjectSpace(top ?? desk, desk),
+    deskLocalCenter: boundsInObjectSpace(desk, desk).getCenter(new THREE.Vector3()),
+  };
+}
+
+/** Mount a standalone monitor asset on a desk top as a first-class bay. */
+function attachAuxDisplay(
+  station: DeskStation,
+  desk: THREE.Object3D,
+  anchors: DeskAnchors,
+  display: THREE.Object3D,
+  index: number,
+  targetWidth: number,
+  xOffset: number,
+): void {
+  openMonitorHousingFronts(display);
+  display.traverse(node => {
+    node.userData.deskId = station.id;
+    node.userData.monitorIndex = index;
+    if (!(node instanceof THREE.Mesh)) return;
+    node.castShadow = true;
+    node.receiveShadow = true;
+    // The standalone monitor assets ship metallic stands and housings. With
+    // no environment map they mirror the cyan room wash and read as a blue
+    // tint; the stock desk monitors are authored non-metallic, so match them.
+    const material = node.material;
+    if (material instanceof THREE.MeshStandardMaterial && material.metalness > 0) {
+      material.metalness = 0;
+      material.needsUpdate = true;
+    }
+  });
+  display.updateMatrixWorld(true);
+  const initial = new THREE.Box3().setFromObject(display);
+  display.scale.multiplyScalar(targetWidth / initial.getSize(new THREE.Vector3()).x);
+  display.updateMatrixWorld(true);
+  const desiredLocal = new THREE.Vector3(
+    anchors.deskLocalCenter.x + xOffset,
+    anchors.topLocalBounds.max.y + .015,
+    anchors.deskLocalCenter.z - .12,
+  );
+  // The custom displays must live below the same authored height pivot as the
+  // stock assemblies. Convert the desk-local placement into pivot space so
+  // later height changes carry the top, HUD and monitors together without
+  // altering their horizontal station placement.
+  const desiredInPivot = station.heightPivot.worldToLocal(desk.localToWorld(desiredLocal));
+  station.heightPivot.add(display);
+  const localBounds = boundsInObjectSpace(display, station.heightPivot);
+  const localBottomCenter = localBounds.getCenter(new THREE.Vector3());
+  localBottomCenter.y = localBounds.min.y;
+  display.position.add(desiredInPivot.sub(localBottomCenter));
+  display.updateWorldMatrix(true, true);
+  let screen: THREE.Mesh | undefined;
+  display.traverse(node => {
+    if (!(node instanceof THREE.Mesh) || screen) return;
+    if (node.name === 'CurvedMon_Screen' || node.name === 'Monitor_ScreenFace') screen = node;
+  });
+  if (!screen) display.traverse(node => {
+    if (!(node instanceof THREE.Mesh) || screen) return;
+    if (/Screen/i.test(node.name)) screen = node;
+  });
+  if (screen) {
+    screen.userData.deskId = station.id; screen.userData.monitorIndex = index;
+    wireMonitorBay(station, index, screen);
+    refreshSessionRaster(station.sessions[index - 1], station, index);
+    streamBroker.notifyChanged(screenLeaseId(station.id, index));
+  }
+}
+
+const SPAWNED_DESK_RADIUS = 12;
+const SPAWNED_DESK_SPACING_DEG = 15;
+const SPAWNED_DESK_BAYS: Record<SpawnedDeskVariant, number> = { '3-up': 3, 'curved+side': 2, '4-up': 4 };
+
+function spawnedDeskLabel(record: SpawnedDeskRecord): string {
+  return `Viewer ${record.display} Desk ${spawnedDeskOrdinal(record.stationId)}`;
+}
+
+/** Fallback middle angles for the three wall arcs, matching the authored GLB. */
+function displayFallbackAzimuth(display: number): number {
+  return THREE.MathUtils.degToRad([0, -120, 120][display - 1] ?? -120);
+}
+
+/**
+ * Floor pose in front of a wall viewer: on the screen's cylindrical middle
+ * angle (mirroring how the polar stationLayout derives station poses from the
+ * presentation arc), between the dais and the wall, facing the screen. Later
+ * desks for the same display fan out around the middle.
+ */
+function placeSpawnedDesk(record: SpawnedDeskRecord, station: DeskStation): void {
+  const viewer = wallViewers[record.display - 1];
+  const ordinal = spawnedDeskOrdinal(record.stationId);
+  const fan = ordinal <= 1 ? 0 : Math.ceil((ordinal - 1) / 2) * (ordinal % 2 === 0 ? 1 : -1);
+  const azimuth = (viewer.mesh ? meshMiddleAzimuth(viewer.mesh) : displayFallbackAzimuth(record.display))
+    + THREE.MathUtils.degToRad(fan * SPAWNED_DESK_SPACING_DEG);
+  const position = new THREE.Vector3(
+    roomLayoutCenter.x + Math.cos(azimuth) * SPAWNED_DESK_RADIUS,
+    0,
+    roomLayoutCenter.z + Math.sin(azimuth) * SPAWNED_DESK_RADIUS,
+  );
+  const desk = station.object;
+  const sampledNormal = viewer.mesh
+    ? sampleSurfaceNormalAtStation(viewer.mesh, position, roomLayoutCenter)
+    : undefined;
+  const operatorDirection = sampledNormal ?? roomLayoutCenter.clone().sub(position).setY(0).normalize();
+  desk.rotation.y = yawFromSurfaceNormal(operatorDirection);
+  desk.position.x = 0; desk.position.z = 0;
+  desk.updateMatrixWorld(true);
+  const visualCenter = new THREE.Box3().setFromObject(desk).getCenter(new THREE.Vector3());
+  desk.position.x += position.x - visualCenter.x;
+  desk.position.z += position.z - visualCenter.z;
+  desk.updateMatrixWorld(true);
+  refreshDeskView(station);
+}
+
+/** Build the full station machinery for one registry record. */
+async function materializeSpawnedDesk(record: SpawnedDeskRecord): Promise<void> {
+  if (desks.has(record.stationId)) return;
+  const monitorCount = SPAWNED_DESK_BAYS[record.variant];
+  const desk = await AssetCache.getInstance().instantiate('/assets/standing_desk_sim_master.glb');
+  if (desks.has(record.stationId) || !spawnedDesks.some(entry => entry.stationId === record.stationId)) return;
+  openMonitorHousingFronts(desk);
+  hideDeskLegMeshes(desk);
+  desk.traverse(node => {
+    const assemblyMatch = node.name.match(/^Monitor_Assembly_([1-4])$/);
+    if (assemblyMatch) {
+      const assembly = Number(assemblyMatch[1]);
+      if (record.variant === 'curved+side' || assembly > monitorCount) node.visible = false;
+      else tagMonitorHierarchy(node, assembly);
+    }
+    if (!(node instanceof THREE.Mesh)) return;
+    node.castShadow = true; node.receiveShadow = true;
+    if (node.name === 'Desk_Wood_Top') {
+      const source = node.material as THREE.MeshStandardMaterial;
+      node.material = new THREE.MeshBasicMaterial({ map: source.map, color: 0xfff1d2, toneMapped: true });
+      node.receiveShadow = false;
+    }
+    const screenMatch = node.name.match(/^MonScreen_([1-4])$/);
+    if (screenMatch && record.variant !== 'curved+side' && Number(screenMatch[1]) <= monitorCount) {
+      node.material = new THREE.MeshBasicMaterial({ color: 0x092634, toneMapped: false });
+      node.userData.monitorIndex = Number(screenMatch[1]);
+    }
+  });
+  desk.updateMatrixWorld(true);
+  const initialBounds = new THREE.Box3().setFromObject(desk);
+  const center = initialBounds.getCenter(new THREE.Vector3());
+  desk.position.set(-center.x, -initialBounds.min.y, -center.z);
+  desk.updateMatrixWorld(true);
+  const station = registerDesk(record.stationId, spawnedDeskLabel(record), desk, monitorCount);
+  station.sessions.push(...Array.from({ length: monitorCount }, createMonitorSession));
+  if (record.variant !== 'curved+side') {
+    desk.traverse(node => {
+      const match = node.name.match(/^MonScreen_([1-4])$/);
+      if (!(node instanceof THREE.Mesh) || !match || Number(match[1]) > monitorCount) return;
+      wireMonitorBay(station, Number(match[1]), node);
+    });
+  }
+  activateStationBays(station);
+  scene.add(desk);
+  placeSpawnedDesk(record, station);
+  if (record.variant === 'curved+side') {
+    const [curved, small] = await Promise.all([
+      AssetCache.getInstance().instantiate('/assets/curved_monitor_ultrawide.glb'),
+      AssetCache.getInstance().instantiate('/assets/monitor_black.glb'),
+    ]);
+    if (!desks.has(record.stationId)) return;
+    const anchors = captureDeskAnchors(desk);
+    attachAuxDisplay(station, desk, anchors, curved, 1, 1.55, -.36);
+    attachAuxDisplay(station, desk, anchors, small, 2, .66, .88);
+    // Re-place: the attached displays grew the visual bounds the centering used.
+    placeSpawnedDesk(record, station);
+  }
+  drawAllDeskHuds();
+  status.textContent = `${spawnedDeskLabel(record).toUpperCase()} ONLINE`;
+}
+
+async function spawnDeskForDisplay(displayIndex: number, variant: SpawnedDeskVariant): Promise<void> {
+  if (displayIndex < 1 || displayIndex > 3) return;
+  const record: SpawnedDeskRecord = {
+    stationId: nextSpawnedDeskStationId(spawnedDesks, displayIndex),
+    display: displayIndex as 1 | 2 | 3,
+    variant,
+  };
+  spawnedDesks.push(record);
+  persistSpawnedDesks();
+  status.textContent = `SPAWNING ${spawnedDeskLabel(record).toUpperCase()}`;
+  try {
+    await materializeSpawnedDesk(record);
+  } catch (error) {
+    console.error('spawned-desk-failed', record, error);
+    spawnedDesks = spawnedDesks.filter(entry => entry.stationId !== record.stationId);
+    persistSpawnedDesks();
+    status.textContent = 'DESK SPAWN FAILED';
+  }
+}
+
+/** HUD ✕: tear down sessions and leases, drop registry entry + station state. */
+function removeSpawnedDesk(stationId: string): void {
+  const known = spawnedDesks.some(record => record.stationId === stationId);
+  spawnedDesks = spawnedDesks.filter(record => record.stationId !== stationId);
+  persistSpawnedDesks();
+  const desk = desks.get(stationId);
+  if (!known || !desk) return;
+  for (let bay = 1; bay <= desk.monitorCount; bay++) {
+    disposeTabStream(stationId, bay);
+    streamBroker.unregister(screenLeaseId(stationId, bay));
+    monitorPickerRegions.delete(tabStreamKey(stationId, bay));
+    monitorPickerScroll.delete(tabStreamKey(stationId, bay));
+    const session = desk.sessions[bay - 1];
+    if (!session) continue;
+    session.generation++;
+    session.socket?.close();
+    session.socket = undefined;
+    session.live = false;
+    session.terminal.dispose();
+    session.texture.dispose();
+  }
+  scene.remove(desk.object);
+  desks.delete(stationId);
+  StateStoreV3.getInstance().removeStationState('panoramic-theater', stationId);
+  if (focusedScreen?.deskId === stationId) focusedScreen = undefined;
+  if (deskViewId === stationId) deskViewId = undefined;
+  if (selectedDeskId === stationId) {
+    selectedDeskId = 'operator-desk-1';
+    localStorage.setItem(DESK_STORAGE_KEY, selectedDeskId);
+  }
+  drawAllDeskHuds();
+  status.textContent = `${desk.label.toUpperCase()} REMOVED`;
+}
+
 resetView.addEventListener('click', () => {
+  clearWallUnitFocus();
   localStorage.removeItem(CAMERA_STORAGE_KEY);
   setOverviewCamera(); saveCamera();
 });
@@ -2201,8 +2489,10 @@ function syncTabStreamNames(): void {
 }
 
 function syncVideoWallPanes(): void {
-  videoWall.setPanes(discoveredPanes as VideoWallPane[]);
-  videoWall.setTabGroups(discoveredTabs);
+  for (const viewer of wallViewers) {
+    viewer.controller.setPanes(discoveredPanes as VideoWallPane[]);
+    viewer.controller.setTabGroups(discoveredTabs);
+  }
 }
 
 function restoreStationConnections(): void {
@@ -2469,7 +2759,6 @@ function frame(now: number): void {
     if (t === 1) { cameraMove = undefined; saveCamera(); }
   }
   controls.update();
-  containCamera();
   streamBroker.tick(camera);
   paintDirtyTabStreams();
   updateCelestialHud(now);

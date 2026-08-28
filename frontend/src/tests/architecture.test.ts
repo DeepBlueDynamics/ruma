@@ -8,6 +8,9 @@ import { cssColor, normalizeCell, normalizeGridRows, paneChrome } from '../hyper
 import { packTabTiles } from '../hyperia/tab-stream';
 import { panoramicTheaterRoom } from '../config/rooms/panoramic-theater';
 import { normalizeBays, StateStoreV3 } from '../state/store';
+import * as THREE from 'three';
+import { nextSpawnedDeskStationId, normalizeSpawnedDesks, spawnedDeskOrdinal } from '../state/spawned-desks';
+import { wallUnitFramingPose } from '../scene/wall-unit';
 
 /**
  * These assertions used to be `console.assert`, which neither throws nor sets a
@@ -127,6 +130,85 @@ export const architectureChecks: Check[] = [
       const garbage = normalizeSectionSources([{ kind: 'pane' }, 'nonsense', 17, { kind: 'tab', tabId: '' }, { kind: 'pane', paneId: 'extra' }]);
       assert(garbage.length === 4, 'oversized blobs clamp to four slots');
       assert(garbage.every(source => source === null), 'malformed entries degrade to disconnected');
+    },
+  },
+  {
+    name: 'Spawned-desk registry normalization',
+    run: () => {
+      // Malformed, duplicate, mismatched and unknown-variant entries degrade
+      // to nothing — a bad blob must never crash boot or spawn ghosts.
+      const records = normalizeSpawnedDesks([
+        { stationId: 'viewer2-desk-1', display: 2, variant: '3-up' },
+        { stationId: 'viewer2-desk-1', display: 2, variant: '4-up' },          // duplicate id
+        { stationId: 'viewer1-desk-2', display: 3, variant: '4-up' },          // display/id mismatch
+        { stationId: 'viewer3-desk-1', display: 3, variant: 'mega-wall' },     // unknown variant
+        { stationId: 'operator-desk-1', display: 1, variant: '3-up' },         // not a spawned id
+        { stationId: 'viewer1-desk-0', display: 1, variant: '3-up' },          // ordinals start at 1
+        'nonsense', 17, null,
+        { stationId: 'viewer1-desk-3', display: 1, variant: 'curved+side' },
+      ]);
+      assert(records.length === 2, 'only well-formed unique records survive');
+      assert(records[0].stationId === 'viewer2-desk-1' && records[0].variant === '3-up', 'first writer wins on duplicates');
+      assert(records[1].stationId === 'viewer1-desk-3', 'valid record survives among garbage');
+
+      assert(normalizeSpawnedDesks(null).length === 0 && normalizeSpawnedDesks('{}').length === 0, 'non-array blobs degrade to empty');
+
+      // Ids reuse the smallest free per-display ordinal.
+      assert(nextSpawnedDeskStationId(records, 1) === 'viewer1-desk-1', 'display 1 reuses ordinal 1');
+      assert(nextSpawnedDeskStationId(records, 2) === 'viewer2-desk-2', 'display 2 skips its live desk');
+      assert(spawnedDeskOrdinal('viewer1-desk-3') === 3 && spawnedDeskOrdinal('garbage') === 0, 'ordinal parsing');
+    },
+  },
+  {
+    name: 'Wall-unit framing pose contains all three screens',
+    run: () => {
+      // Approximate the authored arcs: three screens on a radius-20.6 cylinder
+      // at azimuths 0° and ±120°, glass from y 2.67 to 9.78. The pose must sit
+      // level on the unit's bisector and keep every corner inside the 38°
+      // vertical / aspect-derived horizontal frustum, wall centered.
+      const vFov = 38;
+      const aspect = 16 / 9;
+      const radius = 20.6;
+      const boxFor = (azimuthDeg: number): THREE.Box3 => {
+        const box = new THREE.Box3();
+        for (const edge of [-46, 46]) {
+          const angle = THREE.MathUtils.degToRad(azimuthDeg + edge);
+          box.expandByPoint(new THREE.Vector3(Math.cos(angle) * radius, 2.67, Math.sin(angle) * radius));
+          box.expandByPoint(new THREE.Vector3(Math.cos(angle) * radius, 9.78, Math.sin(angle) * radius));
+        }
+        return box;
+      };
+      const boxes = [boxFor(0), boxFor(-120), boxFor(120)];
+      const bisector = THREE.MathUtils.degToRad(-120);
+      const pose = wallUnitFramingPose(boxes, bisector, vFov, aspect);
+      assert(!!pose, 'pose exists for non-empty boxes');
+
+      const union = new THREE.Box3();
+      for (const box of boxes) union.union(box);
+      const center = union.getCenter(new THREE.Vector3());
+      assert(pose.target.distanceTo(center) < 1e-6, 'wall unit is centered');
+      assert(Math.abs(pose.position.y - center.y) < 1e-6, 'camera stays level with the wall');
+
+      const forward = new THREE.Vector3(Math.cos(bisector), 0, Math.sin(bisector));
+      const onBisector = pose.target.clone().sub(pose.position).normalize();
+      assert(onBisector.distanceTo(forward) < 1e-6, 'camera sits on the angular bisector looking at the wall');
+
+      const right = new THREE.Vector3(-forward.z, 0, forward.x);
+      const tanV = Math.tan(THREE.MathUtils.degToRad(vFov) / 2);
+      const tanH = tanV * aspect;
+      for (const box of boxes) {
+        for (const x of [box.min.x, box.max.x])
+          for (const y of [box.min.y, box.max.y])
+            for (const z of [box.min.z, box.max.z]) {
+              const d = new THREE.Vector3(x, y, z).sub(pose.position);
+              const depth = forward.dot(d);
+              assert(depth > 0, 'every corner is in front of the camera');
+              assert(Math.abs(d.y) <= tanV * depth + 1e-9, `corner escapes the vertical FOV at (${x.toFixed(1)},${y.toFixed(1)},${z.toFixed(1)})`);
+              assert(Math.abs(right.dot(d)) <= tanH * depth + 1e-9, `corner escapes the horizontal FOV at (${x.toFixed(1)},${y.toFixed(1)},${z.toFixed(1)})`);
+            }
+      }
+
+      assert(wallUnitFramingPose([new THREE.Box3()], bisector, vFov, aspect) === undefined, 'empty bounds yield no pose');
     },
   },
   {

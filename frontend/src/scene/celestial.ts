@@ -117,7 +117,7 @@ function createEarthTexture(): THREE.CanvasTexture {
 
 export class CelestialSky {
   readonly group = new THREE.Group();
-  private starPoints!: THREE.Points;
+  private starPoints: THREE.Points[] = [];
   private actionStarPoints!: THREE.Points;
   private forceSunState?: 'day' | 'night';
   private activeObservatory: EarthObservatory = EARTH_OBSERVATORIES[0];
@@ -131,7 +131,6 @@ export class CelestialSky {
 
     // 1. Build Distant Crisp Background Pinpoint Star Field (R = 500m)
     this.buildBackgroundStarField();
-
     // 2. Build Distant Action Point Stars (R = 490m) as crisp 2px points
     this.buildActionPointStars();
 
@@ -190,47 +189,55 @@ export class CelestialSky {
   }
 
   private buildBackgroundStarField(): void {
-    const starCount = 2500;
-    const geometry = new THREE.BufferGeometry();
-    const positions = new Float32Array(starCount * 3);
-    const colors = new Float32Array(starCount * 3);
-
+    // Three magnitude tiers give the field subtle size/brightness variance
+    // while every tier keeps sizeAttenuation:false — crisp fixed-pixel
+    // pinpoints at celestial infinity, never attenuated sprites.
+    const tiers = [
+      { count: 4600, size: 1.2, opacity: .8, minLightness: .55, lightnessRange: .3 },
+      { count: 1900, size: 1.7, opacity: .92, minLightness: .7, lightnessRange: .25 },
+      { count: 500, size: 2.4, opacity: 1, minLightness: .82, lightnessRange: .18 },
+    ];
     const tempColor = new THREE.Color();
+    for (const tier of tiers) {
+      const geometry = new THREE.BufferGeometry();
+      const positions = new Float32Array(tier.count * 3);
+      const colors = new Float32Array(tier.count * 3);
 
-    for (let i = 0; i < starCount; i++) {
-      const u = Math.random();
-      const v = Math.random();
-      const theta = u * 2.0 * Math.PI;
-      const phi = Math.acos(2.0 * v - 1.0);
-      const r = this.domeRadius;
+      for (let i = 0; i < tier.count; i++) {
+        const u = Math.random();
+        const v = Math.random();
+        const theta = u * 2.0 * Math.PI;
+        const phi = Math.acos(2.0 * v - 1.0);
+        const r = this.domeRadius;
 
-      positions[i * 3] = r * Math.sin(phi) * Math.cos(theta);
-      positions[i * 3 + 1] = r * Math.cos(phi);
-      positions[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta);
+        positions[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+        positions[i * 3 + 1] = r * Math.cos(phi);
+        positions[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta);
 
-      const hue = 0.55 + Math.random() * 0.15;
-      const sat = Math.random() * 0.3;
-      tempColor.setHSL(hue, sat, 0.75 + Math.random() * 0.25);
+        const hue = 0.55 + Math.random() * 0.15;
+        const sat = Math.random() * 0.3;
+        tempColor.setHSL(hue, sat, tier.minLightness + Math.random() * tier.lightnessRange);
 
-      colors[i * 3] = tempColor.r;
-      colors[i * 3 + 1] = tempColor.g;
-      colors[i * 3 + 2] = tempColor.b;
+        colors[i * 3] = tempColor.r;
+        colors[i * 3 + 1] = tempColor.g;
+        colors[i * 3 + 2] = tempColor.b;
+      }
+
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+      const material = new THREE.PointsMaterial({
+        size: tier.size,
+        vertexColors: true,
+        transparent: true,
+        opacity: tier.opacity,
+        sizeAttenuation: false,
+      });
+
+      const points = new THREE.Points(geometry, material);
+      this.starPoints.push(points);
+      this.group.add(points);
     }
-
-    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-
-    // sizeAttenuation: false ensures crisp 1.5px pinpoint stars at celestial infinity!
-    const material = new THREE.PointsMaterial({
-      size: 1.5,
-      vertexColors: true,
-      transparent: true,
-      opacity: 0.95,
-      sizeAttenuation: false,
-    });
-
-    this.starPoints = new THREE.Points(geometry, material);
-    this.group.add(this.starPoints);
   }
 
   private buildActionPointStars(): void {

@@ -163,6 +163,15 @@ export class StateStoreV3 {
     this.save();
   }
 
+  /** Forget a station entirely (spawned-desk teardown). No-op when absent. */
+  removeStationState(roomId: string, stationId: string): void {
+    const room = this.state.rooms[roomId];
+    if (!room?.stations[stationId]) return;
+    delete room.stations[stationId];
+    if (room.selectedStationId === stationId) room.selectedStationId = 'operator-desk-1';
+    this.save();
+  }
+
   save(): void {
     try {
       localStorage.setItem(STORAGE_KEY_V3, JSON.stringify(this.state));
