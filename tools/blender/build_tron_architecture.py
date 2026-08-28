@@ -264,7 +264,6 @@ def assign_scene_roles() -> None:
     assign_role("Pedestal_Middle", "pedestal.middle")
     assign_role("Pedestal_Top", "pedestal.top")
     assign_role("Pedestal_Light_Ring", "accent.pedestalRing")
-    assign_role("Area_Cool_Fill", "light.anchor.coolFill")
     assign_role("Screen_Cyan_Spill", "light.anchor.screenCool")
     assign_role("Screen_Warm_Spill", "light.anchor.screenWarm")
     for obj in bpy.context.scene.objects:

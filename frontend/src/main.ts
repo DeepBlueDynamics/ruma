@@ -1162,7 +1162,6 @@ scene.background = new THREE.Color(0x000000);
 scene.add(new THREE.HemisphereLight(0x91bce8, 0x050608, 1.5));
 const key = new THREE.DirectionalLight(0xffffff, 3.2);
 key.position.set(2.5, 4, 3); key.castShadow = false; scene.add(key);
-const rim = new THREE.PointLight(0x178ed1, 18, 8); rim.position.set(-2, 2, -1); scene.add(rim);
 
 const celestialSky = new CelestialSky();
 scene.add(celestialSky.group);
