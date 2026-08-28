@@ -1020,7 +1020,15 @@ renderer.domElement.addEventListener('pointerup', event => {
   const hit = preferred ?? nearest;
   if (!hit && wallPointerTargets.length) {
     const wallHit = deskRaycaster.intersectObjects(wallPointerTargets, false)[0];
-    if (!wallHit || floorOccludes(wallHit.distance)) return;
+    const floorHit = nearestFloorHit();
+    // The floor splits into three wedges, one per wall arc: a click on a
+    // third focuses that display's zone — the screen plus its desks.
+    if (floorHit && (!wallHit || floorHit.distance <= wallHit.distance + 0.04)) {
+      cancelPendingWallClick();
+      focusDisplayZone(nearestViewerByAzimuth(Math.atan2(floorHit.point.z, floorHit.point.x)));
+      return;
+    }
+    if (!wallHit) return;
     // Bezel (frame / light rail) clicks rotate to face that screen's unit;
     // glass clicks route through the display's canvas regions.
     if (wallHit.object.userData.wallBezel === true) {
@@ -1339,6 +1347,23 @@ function focusWallScreen(viewer: WallViewer): void {
   camera.fov = WALL_FOCUS_FOV_DEG; camera.updateProjectionMatrix();
   beginCameraMove(pose.position, pose.target);
   status.textContent = viewer.controller.displayIndex === 2 ? 'MAIN SCREEN' : `ROOM DISPLAY ${viewer.controller.displayIndex}`;
+}
+
+/** Floor-third click: frame the whole zone — the arc and the desks in
+ * front of it. Lower and further back than the screen focus so the desks
+ * stay in frame under the 20 m glass. */
+function focusDisplayZone(viewer: WallViewer): void {
+  const azimuth = viewer.mesh
+    ? meshMiddleAzimuth(viewer.mesh)
+    : displayFallbackAzimuth(viewer.controller.displayIndex);
+  const direction = new THREE.Vector3(Math.cos(azimuth), 0, Math.sin(azimuth));
+  const position = direction.clone().multiplyScalar(-3.5).setY(4.2);
+  const target = direction.clone().multiplyScalar(11).setY(2.6);
+  focusedScreen = undefined; deskViewId = undefined; wallZoom = undefined;
+  viewer.controller.setFocusedPane(undefined);
+  camera.fov = WALL_FOCUS_FOV_DEG; camera.updateProjectionMatrix();
+  beginCameraMove(position, target);
+  status.textContent = `DISPLAY ${viewer.controller.displayIndex} ZONE`;
 }
 
 // Selecting any content section moves the operator camera to that physical
@@ -2417,20 +2442,24 @@ function removeDesk(stationId: string): void {
   if (viewer) focusWallScreen(viewer);
 }
 
-/** Which wall arc a desk faces — nearest by wrapped azimuth delta. */
-function nearestDisplayToDesk(desk: DeskStation): number {
-  const position = new THREE.Vector3();
-  desk.object.getWorldPosition(position);
-  const azimuth = Math.atan2(position.z, position.x);
-  let best = 2, bestDelta = Infinity;
+/** Nearest wall arc by wrapped azimuth delta. */
+function nearestViewerByAzimuth(azimuth: number): WallViewer {
+  let best = wallViewers[1], bestDelta = Infinity;
   for (const viewer of wallViewers) {
     const middle = viewer.mesh
       ? meshMiddleAzimuth(viewer.mesh)
       : displayFallbackAzimuth(viewer.controller.displayIndex);
     const delta = Math.abs(Math.atan2(Math.sin(azimuth - middle), Math.cos(azimuth - middle)));
-    if (delta < bestDelta) { bestDelta = delta; best = viewer.controller.displayIndex; }
+    if (delta < bestDelta) { bestDelta = delta; best = viewer; }
   }
   return best;
+}
+
+/** Which wall arc a desk faces. */
+function nearestDisplayToDesk(desk: DeskStation): number {
+  const position = new THREE.Vector3();
+  desk.object.getWorldPosition(position);
+  return nearestViewerByAzimuth(Math.atan2(position.z, position.x)).controller.displayIndex;
 }
 
 resetView.addEventListener('click', () => {
