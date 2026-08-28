@@ -3,7 +3,7 @@ import type { StationLayout } from '../../scene/layout';
 export const panoramicTheaterRoom = {
   id: 'panoramic-theater',
   shell: {
-    asset: '/assets/panoramic_command_theater_architecture.glb?v=20260819-clean-dais',
+    asset: '/assets/panoramic_command_theater_architecture.glb?v=20260828-open-shell',
     // The approved 1.5x enlargement is baked into the authored Blender scene.
     // Runtime room transforms remain identity so anchors and dimensions are in
     // real authored world units.

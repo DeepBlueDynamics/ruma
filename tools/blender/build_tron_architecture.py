@@ -16,7 +16,7 @@ import bpy
 
 
 SCALE_FACTOR = 1.5
-CORNER_RADIUS = 0.30
+CORNER_RADIUS = 0.10
 RAIL_RADIUS = 0.025
 RAIL_FACE_OFFSET = 0.045
 BASE_COLUMNS = 93
@@ -260,13 +260,10 @@ def remove_retired_decor() -> None:
 
 def assign_scene_roles() -> None:
     assign_role("Room_Floor_Base", "floor.gridBase")
-    assign_role("Ceiling_Main", "ceiling.main")
-    assign_role("Room_Enclosed_Circular_Shell", "room.shell")
     assign_role("Pedestal_Lower", "pedestal.lower")
     assign_role("Pedestal_Middle", "pedestal.middle")
     assign_role("Pedestal_Top", "pedestal.top")
     assign_role("Pedestal_Light_Ring", "accent.pedestalRing")
-    assign_role("Ceiling_Recess_Ring", "accent.ceilingRing")
     assign_role("Area_Cool_Fill", "light.anchor.coolFill")
     assign_role("Screen_Cyan_Spill", "light.anchor.screenCool")
     assign_role("Screen_Warm_Spill", "light.anchor.screenWarm")
@@ -343,7 +340,7 @@ def main() -> None:
         export_apply=False,
     )
 
-    bounds = bpy.data.objects["Room_Enclosed_Circular_Shell"].dimensions
+    bounds = bpy.data.objects["Room_Floor_Base"].dimensions
     result = {
         "blend": str(source),
         "glb": str(glb_path),
