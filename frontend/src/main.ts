@@ -4,7 +4,7 @@ import { Terminal } from '@xterm/xterm';
 import { createDisplaySurface, type DisplaySurface } from './display/surface';
 import { buildStationLayout, sampleSurfaceNormalAtStation, yawFromSurfaceNormal } from './scene/layout';
 import { meshMiddleAzimuth } from './scene/wall-unit';
-import { nextSpawnedDeskStationId, normalizeSpawnedDesks, SPAWNED_DESKS_KEY, spawnedDeskOrdinal, type SpawnedDeskRecord, type SpawnedDeskVariant } from './state/spawned-desks';
+import { CLOSED_DESKS_KEY, nextSpawnedDeskStationId, normalizeClosedDesks, normalizeSpawnedDesks, SPAWNED_DESKS_KEY, spawnedDeskOrdinal, type SpawnedDeskRecord, type SpawnedDeskVariant } from './state/spawned-desks';
 import { recutFloorGrid } from './scene/floor-grid';
 import { removeRoomWallsAndCeiling } from './scene/room-cleanup';
 import { panoramicTheaterRoom } from './config/rooms/panoramic-theater';
@@ -254,6 +254,16 @@ let spawnedDesks: SpawnedDeskRecord[] = (() => {
 })();
 function persistSpawnedDesks(): void {
   localStorage.setItem(SPAWNED_DESKS_KEY, JSON.stringify(spawnedDesks));
+}
+// Built-in desks the operator closed via the HUD ✕. Spawned desks disappear
+// by leaving their registry; the three authored stations persist closure and
+// are skipped at boot.
+let closedDesks: string[] = (() => {
+  try { return normalizeClosedDesks(JSON.parse(localStorage.getItem(CLOSED_DESKS_KEY) ?? 'null')); }
+  catch { return []; }
+})();
+function persistClosedDesks(): void {
+  localStorage.setItem(CLOSED_DESKS_KEY, JSON.stringify(closedDesks));
 }
 let monitorHold: { deskId: string; index: number; start: number; triggered: boolean } | undefined;
 const diagnostics = { appVersion: 'unknown', hyperiaVersion: 'offline', hyperiaOnline: false, gpu: 'unavailable', webgl: false };
@@ -829,8 +839,8 @@ function drawDeskHud(id: string): void {
       ctx.textAlign = 'center'; ctx.fillText(String(monitor), x + tabWidth / 2, 60); ctx.textAlign = 'left';
       hitRegions.push({ kind: 'monitor', x0: x, y0: 30, x1: x + tabWidth, y1: 30 + tabHeight, index: monitor });
   }
-  // Spawned desks carry their teardown affordance on their own HUD.
-  if (spawnedDesks.some(record => record.stationId === id)) {
+  // Every desk carries its teardown affordance on its own HUD.
+  {
     const removeX = selectorStart - 58;
     ctx.fillStyle = '#2a070c'; ctx.fillRect(removeX, 30, 44, 44);
     ctx.strokeStyle = '#ff5864'; ctx.lineWidth = 3; ctx.strokeRect(removeX, 30, 44, 44);
@@ -1055,7 +1065,7 @@ renderer.domElement.addEventListener('pointerup', event => {
     }
     if (region?.kind === 'scroll-up') scrollDeskHud(desk, -1);
     if (region?.kind === 'scroll-down') scrollDeskHud(desk, 1);
-    if (region?.kind === 'remove') removeSpawnedDesk(desk.id);
+    if (region?.kind === 'remove') removeDesk(desk.id);
   }
   else selectDesk(deskId);
 });
@@ -1862,6 +1872,7 @@ function reconcileMonitorSources(): void {
 }
 
 AssetCache.getInstance().instantiate('/assets/standing_desk_sim_master.glb').then((monitor) => {
+  if (closedDesks.includes('operator-desk-1')) return;
   openMonitorHousingFronts(monitor);
   hideDeskLegMeshes(monitor);
   let foundScreen = false;
@@ -1968,7 +1979,13 @@ AssetCache.getInstance().instantiate('/assets/standing_desk_sim_master.glb').the
       wallViewers,
       get spawnedDesks() { return spawnedDesks; },
       spawnDesk: (display: number, variant: SpawnedDeskVariant) => spawnDeskForDisplay(display, variant),
-      removeSpawnedDesk,
+      removeDesk,
+      reopenDesk: (stationId: string) => {
+        closedDesks = closedDesks.filter(id => id !== stationId);
+        persistClosedDesks();
+        location.reload();
+      },
+      get closedDesks() { return closedDesks; },
       toggleWallScreenFocus: (display: number) => {
         const viewer = wallViewers.find(x => x.controller.displayIndex === display);
         if (viewer) toggleWallScreenFocus(viewer);
@@ -2001,6 +2018,7 @@ AssetCache.getInstance().instantiate('/assets/standing_desk_sim_master.glb').the
 // One additional authored four-monitor station. It remains a separate tracked
 // desk entity so selection and its projected HUD never leak into desk 1.
 AssetCache.getInstance().instantiate('/assets/standing_desk_sim_master.glb').then((desk) => {
+  if (closedDesks.includes('operator-desk-2')) return;
   openMonitorHousingFronts(desk);
   hideDeskLegMeshes(desk);
   desk.traverse(node => {
@@ -2046,6 +2064,7 @@ AssetCache.getInstance().instantiate('/assets/standing_desk_sim_master.glb').the
 // Right station: authored desk with a large curved primary and smaller
 // secondary display replacing its stock monitor assemblies.
 AssetCache.getInstance().instantiate('/assets/standing_desk_sim_master.glb').then((desk) => {
+  if (closedDesks.includes('operator-desk-3')) return;
   openMonitorHousingFronts(desk);
   hideDeskLegMeshes(desk);
   desk.traverse(node => {
@@ -2297,14 +2316,20 @@ async function spawnDeskForDisplay(displayIndex: number, variant: SpawnedDeskVar
   }
 }
 
-/** HUD ✕: tear down sessions and leases, drop registry entry + station state,
- * then return the camera to the main screen this desk was spawned for. */
-function removeSpawnedDesk(stationId: string): void {
+/** HUD ✕: tear down sessions and leases, then return the camera to the
+ * desk's main screen. Spawned desks leave their registry; built-in stations
+ * persist their closure and are skipped on the next boot. */
+function removeDesk(stationId: string): void {
   const record = spawnedDesks.find(entry => entry.stationId === stationId);
-  spawnedDesks = spawnedDesks.filter(entry => entry.stationId !== stationId);
-  persistSpawnedDesks();
   const desk = desks.get(stationId);
-  if (!record || !desk) return;
+  if (!desk) return;
+  if (record) {
+    spawnedDesks = spawnedDesks.filter(entry => entry.stationId !== stationId);
+    persistSpawnedDesks();
+  } else if (!closedDesks.includes(stationId)) {
+    closedDesks = [...closedDesks, stationId];
+    persistClosedDesks();
+  }
   for (let bay = 1; bay <= desk.monitorCount; bay++) {
     disposeTabStream(stationId, bay);
     streamBroker.unregister(screenLeaseId(stationId, bay));
@@ -2325,13 +2350,30 @@ function removeSpawnedDesk(stationId: string): void {
   if (focusedScreen?.deskId === stationId) focusedScreen = undefined;
   if (deskViewId === stationId) deskViewId = undefined;
   if (selectedDeskId === stationId) {
-    selectedDeskId = 'operator-desk-1';
+    selectedDeskId = desks.keys().next().value ?? '';
     localStorage.setItem(DESK_STORAGE_KEY, selectedDeskId);
   }
   drawAllDeskHuds();
   status.textContent = `${desk.label.toUpperCase()} REMOVED`;
-  const viewer = wallViewers.find(v => v.controller.displayIndex === record.display);
+  const display = record?.display ?? nearestDisplayToDesk(desk);
+  const viewer = wallViewers.find(v => v.controller.displayIndex === display);
   if (viewer) focusWallScreen(viewer);
+}
+
+/** Which wall arc a desk faces — nearest by wrapped azimuth delta. */
+function nearestDisplayToDesk(desk: DeskStation): number {
+  const position = new THREE.Vector3();
+  desk.object.getWorldPosition(position);
+  const azimuth = Math.atan2(position.z, position.x);
+  let best = 2, bestDelta = Infinity;
+  for (const viewer of wallViewers) {
+    const middle = viewer.mesh
+      ? meshMiddleAzimuth(viewer.mesh)
+      : displayFallbackAzimuth(viewer.controller.displayIndex);
+    const delta = Math.abs(Math.atan2(Math.sin(azimuth - middle), Math.cos(azimuth - middle)));
+    if (delta < bestDelta) { bestDelta = delta; best = viewer.controller.displayIndex; }
+  }
+  return best;
 }
 
 resetView.addEventListener('click', () => {

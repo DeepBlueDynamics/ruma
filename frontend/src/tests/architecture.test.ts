@@ -8,7 +8,7 @@ import { cssColor, normalizeCell, normalizeGridRows, paneChrome } from '../hyper
 import { packTabTiles } from '../hyperia/tab-stream';
 import { panoramicTheaterRoom } from '../config/rooms/panoramic-theater';
 import { normalizeBays, StateStoreV3 } from '../state/store';
-import { nextSpawnedDeskStationId, normalizeSpawnedDesks, spawnedDeskOrdinal } from '../state/spawned-desks';
+import { nextSpawnedDeskStationId, normalizeClosedDesks, normalizeSpawnedDesks, spawnedDeskOrdinal } from '../state/spawned-desks';
 
 /**
  * These assertions used to be `console.assert`, which neither throws nor sets a
@@ -155,6 +155,15 @@ export const architectureChecks: Check[] = [
       assert(nextSpawnedDeskStationId(records, 1) === 'viewer1-desk-1', 'display 1 reuses ordinal 1');
       assert(nextSpawnedDeskStationId(records, 2) === 'viewer2-desk-2', 'display 2 skips its live desk');
       assert(spawnedDeskOrdinal('viewer1-desk-3') === 3 && spawnedDeskOrdinal('garbage') === 0, 'ordinal parsing');
+    },
+  },
+  {
+    name: 'Closed built-in desks normalize to unique operator-desk ids',
+    run: () => {
+      assert(normalizeClosedDesks(null).length === 0 && normalizeClosedDesks('junk').length === 0, 'non-array blobs degrade to empty');
+      const cleaned = normalizeClosedDesks(['operator-desk-1', 'operator-desk-1', 'viewer1-desk-1', 42, 'operator-desk-3']);
+      assert(cleaned.length === 2 && cleaned.includes('operator-desk-1') && cleaned.includes('operator-desk-3'),
+        'dedupes and drops non-builtin entries');
     },
   },
   {

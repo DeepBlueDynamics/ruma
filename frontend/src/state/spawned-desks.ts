@@ -58,3 +58,17 @@ export function nextSpawnedDeskStationId(records: readonly SpawnedDeskRecord[], 
   while (used.has(ordinal)) ordinal++;
   return spawnedDeskStationId(display, ordinal);
 }
+
+/** Built-in stations the operator has closed via the HUD ✕; honored at boot.
+ * Spawned desks disappear by leaving their registry — the three authored
+ * desks persist an explicit closure instead. */
+export const CLOSED_DESKS_KEY = 'ops-room/closed-desks-v1';
+
+export function normalizeClosedDesks(parsed: unknown): string[] {
+  if (!Array.isArray(parsed)) return [];
+  const seen = new Set<string>();
+  for (const entry of parsed) {
+    if (typeof entry === 'string' && /^operator-desk-\d+$/.test(entry)) seen.add(entry);
+  }
+  return [...seen];
+}
