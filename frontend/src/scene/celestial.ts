@@ -157,15 +157,25 @@ export class CelestialSky {
     this.earthMesh.add(atmosMesh);
     this.group.add(this.earthMesh);
 
-    // 4. Build Distant Sun Mesh (R = 480m)
+    // 4. Build Distant Sun Mesh (R = 480m) — warm yellow disc with a soft
+    // corona so it reads as the sun, not a white ball.
     const sunGeo = new THREE.SphereGeometry(12, 16, 16);
     const sunMat = new THREE.MeshBasicMaterial({
-      color: 0xfffaed,
+      color: 0xffd75e,
       toneMapped: false,
     });
     this.sunMesh = new THREE.Mesh(sunGeo, sunMat);
+    const coronaGeo = new THREE.SphereGeometry(16, 16, 16);
+    const coronaMat = new THREE.MeshBasicMaterial({
+      color: 0xffe9a8,
+      transparent: true,
+      opacity: 0.28,
+      side: THREE.BackSide,
+      toneMapped: false,
+    });
+    this.sunMesh.add(new THREE.Mesh(coronaGeo, coronaMat));
 
-    this.sunLight = new THREE.DirectionalLight(0xfff8eb, 3.2);
+    this.sunLight = new THREE.DirectionalLight(0xffeec9, 3.2);
     this.sunLight.castShadow = false;
     this.group.add(this.sunLight);
     this.group.add(this.sunMesh);
