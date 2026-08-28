@@ -2297,13 +2297,14 @@ async function spawnDeskForDisplay(displayIndex: number, variant: SpawnedDeskVar
   }
 }
 
-/** HUD ✕: tear down sessions and leases, drop registry entry + station state. */
+/** HUD ✕: tear down sessions and leases, drop registry entry + station state,
+ * then return the camera to the main screen this desk was spawned for. */
 function removeSpawnedDesk(stationId: string): void {
-  const known = spawnedDesks.some(record => record.stationId === stationId);
-  spawnedDesks = spawnedDesks.filter(record => record.stationId !== stationId);
+  const record = spawnedDesks.find(entry => entry.stationId === stationId);
+  spawnedDesks = spawnedDesks.filter(entry => entry.stationId !== stationId);
   persistSpawnedDesks();
   const desk = desks.get(stationId);
-  if (!known || !desk) return;
+  if (!record || !desk) return;
   for (let bay = 1; bay <= desk.monitorCount; bay++) {
     disposeTabStream(stationId, bay);
     streamBroker.unregister(screenLeaseId(stationId, bay));
@@ -2329,6 +2330,8 @@ function removeSpawnedDesk(stationId: string): void {
   }
   drawAllDeskHuds();
   status.textContent = `${desk.label.toUpperCase()} REMOVED`;
+  const viewer = wallViewers.find(v => v.controller.displayIndex === record.display);
+  if (viewer) focusWallScreen(viewer);
 }
 
 resetView.addEventListener('click', () => {
