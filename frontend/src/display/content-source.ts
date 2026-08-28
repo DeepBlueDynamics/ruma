@@ -5,7 +5,6 @@ export type ContentSource =
   | { kind: 'boot' }
   | { kind: 'pty'; paneId: string }
   | { kind: 'web-pixels'; paneId: string }
-  | { kind: 'terminal'; terminalId: string }
   | { kind: 'wall-status' };
 
 export const DESIGN_CONTENT_ASPECT = 16 / 10;

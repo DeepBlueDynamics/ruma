@@ -8,14 +8,13 @@ import { recutFloorGrid } from './scene/floor-grid';
 import { removeRoomWallsAndCeiling } from './scene/room-cleanup';
 import { panoramicTheaterRoom } from './config/rooms/panoramic-theater';
 import { bindSessionSurface, createMonitorSession, drawContained, fillBezel, sessionContentRect, type MonitorSession } from './display/session';
-import { VideoWallController, type VideoWallContentRegion, type VideoWallPane, type VideoWallRouterRegion } from './display/video-wall';
+import { VideoWallController, type VideoWallPane, type VideoWallRegion, type VideoWallRouterRegion } from './display/video-wall';
 import { sessionAlreadyStreaming } from './hyperia/stream';
 import { TabStream } from './hyperia/tab-stream';
 import type { Color, WallMessage } from './hyperia/protocol';
 import { paintOverviewGrid } from './content/source';
 import { StreamBroker } from './surfaces/broker';
-import { NAV_ROUTE_TERMINAL, NAV_SOLUTION_TERMINAL, TERMINAL_CATALOG, terminalById, type TerminalDefinition } from './terminal/catalog';
-import type { OpsRoomCommand, OpsRoomCommandResult, OpsRoomSnapshot, TerminalConnection } from './control/ops-room';
+import type { OpsRoomCommand, OpsRoomCommandResult, OpsRoomSnapshot, SourceConnection, SourceRef } from './control/ops-room';
 import { installClientObservability } from './observability/client-logs';
 import { SystemLoadTracker } from './observability/system-load';
 import { AssetCache } from './assets/cache';
@@ -50,11 +49,9 @@ function registerDeskScreen(desk: DeskStation, index: number, mesh: THREE.Mesh):
     getAssignment: () => {
       const session = desk.sessions[index - 1];
       const paneId = desk.monitorTargets[index - 1];
-      // Catalog terminals (nav.route / nav.solution) are local placeholders,
-      // not Hyperia pane ids. Broker stays none for those bays.
       // Tab bindings own their own /ws/tab socket; the broker must not try to
       // lease "tab:<id>" as if it were a paneId.
-      if (!session || !paneId || terminalById(paneId) || tabIdFromBinding(paneId)) return null;
+      if (!session || !paneId || tabIdFromBinding(paneId)) return null;
       const pane = discoveredPanes.find(candidate => candidate.paneId === paneId);
       const kind = pane?.shell === 'web' || session.source.kind === 'web-pixels' ? 'pixels' : 'pty';
       return { paneId, kind };
@@ -115,27 +112,11 @@ function registerDeskScreen(desk: DeskStation, index: number, mesh: THREE.Mesh):
   });
 }
 
-let targetPane = '';
-let selectedMonitor = 1;
-const monitorTargets = ['', ''];
-const MONITOR_STORAGE_KEY = 'ops-room-monitor-targets-v1';
-try {
-  const savedTargets = JSON.parse(localStorage.getItem(MONITOR_STORAGE_KEY) ?? 'null');
-  if (Array.isArray(savedTargets)) savedTargets.slice(0, 2).forEach((paneId, index) => { if (typeof paneId === 'string') monitorTargets[index] = paneId; });
-} catch { /* ignore corrupt local state */ }
-
 const app = document.querySelector<HTMLDivElement>('#app')!;
-app.innerHTML = `<div id="status">LOADING DESK PROTOTYPE</div><div id="system-load" data-level="ok" aria-label="System load tracker"></div><button id="reset-view" type="button">RESET VIEW</button><div id="pane-picker"><div class="hud-beam"></div><div class="picker-title">DESK TERMINAL ROUTER · MONITOR <span id="hud-monitor-number">1</span></div><button id="facet-toggle" class="facet-toggle" type="button">△ FACET FX · ON</button><div id="pane-buttons"></div></div>`;
+app.innerHTML = `<div id="status">LOADING DESK PROTOTYPE</div><div id="system-load" data-level="ok" aria-label="System load tracker"></div><button id="reset-view" type="button">RESET VIEW</button>`;
 const status = document.querySelector<HTMLDivElement>('#status')!;
 const systemLoad = new SystemLoadTracker(document.querySelector<HTMLDivElement>('#system-load')!);
-const paneButtons = document.querySelector<HTMLDivElement>('#pane-buttons')!;
-const panePicker = document.querySelector<HTMLDivElement>('#pane-picker')!;
 const resetView = document.querySelector<HTMLButtonElement>('#reset-view')!;
-const monitorTabs: HTMLButtonElement[] = [];
-const hudMonitorNumber = document.querySelector<HTMLSpanElement>('#hud-monitor-number')!;
-const facetToggle = document.querySelector<HTMLButtonElement>('#facet-toggle')!;
-const facetEnabled = [true, true];
-const monitorShells: THREE.Mesh[][] = [[], []];
 
 const DESK_LEG_MESH_NAMES = new Set([
   'Desk_Foot_Left',
@@ -159,7 +140,6 @@ function hideDeskLegMeshes(root: THREE.Object3D): void {
 class DeskStation {
   selectedMonitor = 1;
   readonly monitorTargets: string[];
-  readonly facetEnabled: boolean[];
   readonly monitorScreens = new Map<number, THREE.Mesh>();
   readonly sessions: MonitorSession[] = [];
   expandedTabId = '';
@@ -196,21 +176,22 @@ class DeskStation {
       DESK_HEIGHT_MAX_METRES,
     );
     this.applyHeight();
-    this.monitorTargets = Array.from({ length: monitorCount }, (_, i) => bayByIndex(stationState, i + 1)?.paneId ?? '');
+    // Retired placeholder-catalog assignments ('terminal:*') degrade to an
+    // empty bay: powered-on it paints the on-surface source picker.
+    this.monitorTargets = Array.from({ length: monitorCount }, (_, i) => {
+      const paneId = bayByIndex(stationState, i + 1)?.paneId ?? '';
+      return paneId.startsWith('terminal:') ? '' : paneId;
+    });
     this.restoredPower = Array.from({ length: monitorCount }, (_, i) => bayByIndex(stationState, i + 1)?.powered === true);
     this.selectedMonitor = Math.min(monitorCount, Math.max(1, stationState.selectedMonitor ?? 1));
     this.expandedTabId = stationState.expandedTabId ?? '';
     this.hudScroll = stationState.hudScroll ?? 0;
-    this.facetEnabled = Array.from({ length: monitorCount }, () => true);
   }
 
 
   selectMonitor(index: number): void {
     if (index < 1 || index > this.monitorCount) return;
     this.selectedMonitor = index;
-    selectedMonitor = index;
-    targetPane = this.monitorTargets[index - 1];
-    hudMonitorNumber.textContent = `${index} / ${this.monitorCount}`;
     this.save();
   }
 
@@ -251,7 +232,7 @@ class DeskStation {
   }
 }
 type DeskHudHitRegion = {
-  kind: 'monitor' | 'tab' | 'tab-connect' | 'pane' | 'terminal' | 'scroll-up' | 'scroll-down';
+  kind: 'monitor' | 'tab' | 'tab-connect' | 'pane' | 'scroll-up' | 'scroll-down';
   x0: number;
   y0: number;
   x1: number;
@@ -259,27 +240,12 @@ type DeskHudHitRegion = {
   index?: number;
   tabId?: string;
   paneId?: string;
-  terminalId?: string;
 };
 const desks = new Map<string, DeskStation>();
 const DESK_STORAGE_KEY = 'ops-room-selected-desk-v1';
 let selectedDeskId = localStorage.getItem(DESK_STORAGE_KEY) || 'operator-desk-1';
 let monitorHold: { deskId: string; index: number; start: number; triggered: boolean } | undefined;
 const diagnostics = { appVersion: 'unknown', hyperiaVersion: 'offline', hyperiaOnline: false, gpu: 'unavailable', webgl: false };
-const terminalImages = new Map<string, HTMLImageElement>();
-for (const terminal of TERMINAL_CATALOG) {
-  if (terminal.adapter.kind !== 'placeholder-image') continue;
-  const image = new Image();
-  image.decoding = 'async';
-  image.src = terminal.adapter.asset;
-  image.addEventListener('load', () => {
-    desks.forEach(desk => desk.sessions.forEach((session, index) => {
-      if (session.powered && desk.monitorTargets[index] === terminal.id) renderTerminalPlaceholder(session, terminal);
-    }));
-    drawAllDeskHuds();
-  });
-  terminalImages.set(terminal.id, image);
-}
 
 let resolveOpsRoomReady!: () => void;
 let opsRoomReadyResolved = false;
@@ -292,17 +258,27 @@ function maybeResolveOpsRoomReady(): void {
 }
 
 function opsRoomSnapshot(): OpsRoomSnapshot {
-  const targets = new Map<string, TerminalConnection[]>(
-    TERMINAL_CATALOG.map(terminal => [terminal.id, []]),
-  );
-  for (const section of mainDisplayTerminalSections) targets.get(section.terminal.id)?.push({
-    kind: 'room-display-section',
-    displayId: 'room-display-2',
-    sectionId: section.sectionId,
+  const connections = new Map<string, { source: SourceRef; targets: SourceConnection[] }>();
+  const targetsFor = (source: SourceRef): SourceConnection[] => {
+    const key = source.kind === 'pane' ? `pane:${source.paneId}` : `tab:${source.tabId}`;
+    let entry = connections.get(key);
+    if (!entry) {
+      entry = { source, targets: [] };
+      connections.set(key, entry);
+    }
+    return entry.targets;
+  };
+  videoWall.sectionSourcesSnapshot().forEach((source, index) => {
+    if (source) targetsFor(source).push({
+      kind: 'room-display-section',
+      displayId: 'room-display-2',
+      sectionId: `section-${index + 1}`,
+    });
   });
-  desks.forEach(desk => desk.monitorTargets.forEach((terminalId, index) => {
-    if (!terminalById(terminalId)) return;
-    targets.get(terminalId)?.push({
+  desks.forEach(desk => desk.monitorTargets.forEach((target, index) => {
+    if (!target) return;
+    const tabId = tabIdFromBinding(target);
+    targetsFor(tabId ? { kind: 'tab', tabId } : { kind: 'pane', paneId: target }).push({
       kind: 'desk-monitor',
       deskId: desk.id,
       monitorId: `monitor-${index + 1}`,
@@ -312,34 +288,34 @@ function opsRoomSnapshot(): OpsRoomSnapshot {
   return {
     schema: 'ops-room/browser-state@1',
     sceneReady: !!roomShell && desks.size >= 3,
-    terminals: [...TERMINAL_CATALOG],
-    terminalConnections: TERMINAL_CATALOG.map(terminal => ({
-      terminalId: terminal.id,
-      targets: targets.get(terminal.id) ?? [],
-    })),
+    tabs: discoveredTabs.map(tab => ({ tabId: tab.tabId, name: tab.name, paneIds: tab.panes.map(pane => pane.paneId) })),
+    panes: discoveredPanes.map(pane => ({ paneId: pane.paneId, name: paneCreatureName(pane) || pane.paneId.slice(0, 8), shell: pane.shell })),
+    connections: [...connections.values()],
   };
 }
 
 async function dispatchOpsRoom(command: OpsRoomCommand): Promise<OpsRoomCommandResult> {
-  const terminal = terminalById(command.terminalId);
-  if (!terminal) return {
+  const source = command.source;
+  const known = source.kind === 'pane'
+    ? discoveredPanes.some(pane => pane.paneId === source.paneId)
+    : discoveredTabs.some(tab => tab.tabId === source.tabId);
+  if (!known) return {
     ok: false,
     command: command.kind,
-    code: 'terminal_not_found',
-    message: `Unknown terminal ${command.terminalId}`,
+    code: 'source_not_found',
+    message: `Unknown ${source.kind} ${source.kind === 'pane' ? source.paneId : source.tabId}`,
   };
-  if (command.kind === 'terminal.read') return {
+  if (command.kind === 'source.read') return {
     ok: true,
     command: command.kind,
-    terminal,
     snapshot: opsRoomSnapshot(),
   };
 
-  if (command.kind !== 'terminal.connect' || command.target?.kind !== 'desk-monitor') return {
+  if (command.kind !== 'source.connect' || command.target?.kind !== 'desk-monitor') return {
     ok: false,
     command: command.kind,
     code: 'invalid_target',
-    message: 'Terminal connect requires a desk-monitor target',
+    message: 'Source connect requires a desk-monitor target',
   };
 
   const match = /^monitor-(\d+)$/.exec(command.target.monitorId);
@@ -351,8 +327,9 @@ async function dispatchOpsRoom(command: OpsRoomCommand): Promise<OpsRoomCommandR
     code: 'target_not_ready',
     message: `Desk monitor ${command.target.deskId}/${command.target.monitorId} is not ready`,
   };
-  connectTerminal(desk, monitorIndex, terminal);
-  return { ok: true, command: command.kind, terminal, snapshot: opsRoomSnapshot() };
+  if (source.kind === 'tab') connectTabToMonitor(desk, monitorIndex, source.tabId);
+  else connectPaneToMonitor(desk, monitorIndex, source.paneId);
+  return { ok: true, command: command.kind, snapshot: opsRoomSnapshot() };
 }
 
 window.opsRoom = {
@@ -515,17 +492,11 @@ function paintDirtyTabStreams(): void {
 }
 
 const videoWall = new VideoWallController();
-videoWall.setTerminalCatalog(TERMINAL_CATALOG);
-// Topology only. The presentation wall paints from dedicated /ws/pane and
-// /ws/pixels leases — not from this overview feed.
+// Topology only. The presentation wall paints from dedicated /ws/pane,
+// /ws/pixels and /ws/tab leases — not from this overview feed. All four wall
+// sections boot disconnected and paint their on-surface source picker until
+// the operator assigns a live pane or tab.
 streamBroker.onWallMessage(message => ingestWallTopology(message));
-const mainDisplayTerminalSections = [
-  { sectionIndex: 0, sectionId: 'left', terminal: NAV_SOLUTION_TERMINAL },
-  { sectionIndex: 1, sectionId: 'middle', terminal: NAV_ROUTE_TERMINAL },
-] as const;
-for (const section of mainDisplayTerminalSections) {
-  videoWall.setSectionTerminal(section.sectionIndex, section.terminal);
-}
 
 function applyStationPlacement(desk: THREE.Object3D, id: string): void {
   const placement = stationPlacements.get(id); if (!placement) return;
@@ -617,7 +588,6 @@ function selectDesk(id: string): void {
   selectedDeskId = id;
   desk.selectMonitor(desk.selectedMonitor);
   localStorage.setItem(DESK_STORAGE_KEY, id);
-  panePicker.classList.remove('open');
   drawAllDeskHuds();
   // Clicking the desk body is always navigation, including re-selecting the
   // current desk after orbiting away or leaning into a monitor.
@@ -643,7 +613,7 @@ function chooseMonitor(index: number, deskId = selectedDeskId): void {
   localStorage.setItem(DESK_STORAGE_KEY, desk.id);
   desk.selectMonitor(index);
   desk.save();
-  updateFacetButton(); refreshPaneButtons(); drawAllDeskHuds();
+  drawAllDeskHuds();
 }
 
 type CameraMove = {
@@ -820,7 +790,6 @@ function focusDeskMonitor(deskId: string, monitorIndex: number): void {
   deskViewId = undefined;
   controls.minDistance = .08;
   controls.zoomSpeed = 1.35;
-  panePicker.classList.remove('open');
   beginCameraMove(position, center);
   status.textContent = `${desk.label.toUpperCase()} · MONITOR ${monitorIndex} FOCUS`;
 }
@@ -884,10 +853,9 @@ function drawDeskHud(id: string): void {
   }
   const deskTarget = desk.monitorTargets[desk.selectedMonitor - 1];
   const rows: Array<
-    | { kind: 'terminal'; terminal: TerminalDefinition }
     | { kind: 'tab'; tab: TabGroup }
     | { kind: 'pane'; pane: PaneInfo }
-  > = TERMINAL_CATALOG.map(terminal => ({ kind: 'terminal' as const, terminal }));
+  > = [];
   for (const tab of discoveredTabs) {
     rows.push({ kind: 'tab', tab });
     if (desk.expandedTabId === tab.tabId) tab.panes.forEach(pane => rows.push({ kind: 'pane', pane }));
@@ -897,14 +865,7 @@ function drawDeskHud(id: string): void {
   desk.hudScroll = Math.max(0, Math.min(desk.hudScroll, desk.hudScrollMax));
   let y = 108;
   for (const row of rows.slice(desk.hudScroll, desk.hudScroll + visibleRows)) {
-    if (row.kind === 'terminal') {
-      const active = row.terminal.id === deskTarget;
-      ctx.fillStyle = active ? '#123523' : '#071720'; ctx.fillRect(34, y, 858, 46);
-      ctx.strokeStyle = active ? '#79dc55' : '#24502e'; ctx.strokeRect(34, y, 858, 46);
-      ctx.fillStyle = active ? '#d9ffcb' : '#a7d79a'; ctx.font = '21px Cascadia Mono, monospace';
-      ctx.fillText(`TERMINAL  ${row.terminal.label}`, 50, y + 30);
-      hitRegions.push({ kind: 'terminal', x0: 34, y0: y, x1: 892, y1: y + 46, terminalId: row.terminal.id });
-    } else if (row.kind === 'tab') {
+    if (row.kind === 'tab') {
       const tab = row.tab, expanded = desk.expandedTabId === tab.tabId;
       ctx.fillStyle = expanded ? '#0b4253' : '#071720'; ctx.fillRect(34, y, 858, 46);
       ctx.strokeStyle = expanded ? '#42dcff' : '#17475b'; ctx.strokeRect(34, y, 858, 46);
@@ -957,33 +918,6 @@ function drawDeskHud(id: string): void {
 }
 function drawAllDeskHuds(): void { desks.forEach((_, id) => drawDeskHud(id)); }
 
-function updateFacetButton(): void {
-  const enabled = facetEnabled[selectedMonitor - 1];
-  facetToggle.textContent = `△ FACET FX · ${enabled ? 'ON' : 'OFF'}`;
-  facetToggle.classList.toggle('active', enabled);
-}
-
-function applyFacetMode(monitorIndex: number): void {
-  for (const mesh of monitorShells[monitorIndex]) {
-    const material = mesh.material as THREE.MeshStandardMaterial;
-    material.flatShading = facetEnabled[monitorIndex];
-    material.needsUpdate = true;
-  }
-}
-
-facetToggle.addEventListener('click', () => {
-  const index = selectedMonitor - 1;
-  facetEnabled[index] = !facetEnabled[index];
-  applyFacetMode(index);
-  updateFacetButton();
-});
-monitorTabs.forEach(button => button.addEventListener('click', () => {
-  selectedMonitor = Number(button.dataset.monitor);
-  targetPane = monitorTargets[selectedMonitor - 1];
-  monitorTabs.forEach(tab => tab.classList.toggle('active', Number(tab.dataset.monitor) === selectedMonitor));
-  updateFacetButton();
-  refreshPaneButtons();
-}));
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', preserveDrawingBuffer: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -1088,6 +1022,10 @@ renderer.domElement.addEventListener('pointerup', event => {
     // bezel and housing sit within a hundredth of a metre of the screen face,
     // so the winner is effectively arbitrary and could otherwise frame a stand.
     const screen = desk?.monitorScreens.get(hitMonitorIndex) ?? hit.object;
+    // An idle powered bay paints its source picker directly on the glass;
+    // a click that lands on one of its rows routes content, never the camera.
+    if (desk && hit.object === desk.monitorScreens.get(hitMonitorIndex) && hit.uv
+      && dispatchMonitorPickerClick(desk, hitMonitorIndex, hit.uv)) return;
     // Preserve focusedScreen until toggleScreenFocus has decided whether this
     // click is a lean-in or a return to the seated desk/head position.
     activateDeskWithoutCamera(deskId);
@@ -1116,12 +1054,6 @@ renderer.domElement.addEventListener('pointerup', event => {
       // /ws/wall feed and is never replaced by a HUD selection.
       connectPaneToMonitor(desk, desk.selectedMonitor, region.paneId);
     }
-    if (region?.kind === 'terminal' && region.terminalId) {
-      const terminal = terminalById(region.terminalId);
-      if (terminal) {
-        connectTerminal(desk, desk.selectedMonitor, terminal);
-      }
-    }
     if (region?.kind === 'scroll-up') scrollDeskHud(desk, -1);
     if (region?.kind === 'scroll-down') scrollDeskHud(desk, 1);
   }
@@ -1148,8 +1080,8 @@ renderer.domElement.addEventListener('dblclick', event => {
   videoWall.setFocusedPane(undefined);
   const focusRegion = wallSectionFocusRegion(sectionIndex);
   if (focusRegion) focusWallRegion(focusRegion);
-  console.info('main-screen-pane-picker-opened', { sectionIndex: sectionIndex + 1, input: 'dblclick' });
-  status.textContent = `MAIN SCREEN · SECTION ${sectionIndex + 1} PANE PICKER`;
+  console.info('main-screen-source-picker-opened', { sectionIndex: sectionIndex + 1, input: 'dblclick' });
+  status.textContent = `MAIN SCREEN · SECTION ${sectionIndex + 1} SOURCE PICKER`;
 });
 
 function scrollDeskHud(desk: DeskStation, amount: number): void {
@@ -1231,7 +1163,7 @@ const floor = new THREE.Mesh(
 floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true; scene.add(floor);
 
 function resetRoom(): void {
-  monitorHold = undefined; focusedScreen = undefined; deskViewId = undefined; targetPane = ''; wallZoomedContentId = undefined;
+  monitorHold = undefined; focusedScreen = undefined; deskViewId = undefined; wallZoomedContentId = undefined;
   videoWall.setFocusedPane(undefined);
   desks.forEach(desk => desk.reset());
   selectedDeskId = 'operator-desk-1'; localStorage.setItem(DESK_STORAGE_KEY, selectedDeskId);
@@ -1268,7 +1200,10 @@ function focusPresentationScreen(): void {
 // portion of the arc; selecting it again returns to the complete wall.
 let wallZoomedContentId: string | undefined;
 
-function pointOnWallRegion(region: VideoWallContentRegion): THREE.Vector3 | undefined {
+/** The camera framing only needs a titled canvas rect, not a full region. */
+type WallFocusRect = { title: string; x0: number; y0: number; x1: number; y1: number };
+
+function pointOnWallRegion(region: WallFocusRect): THREE.Vector3 | undefined {
   if (!wallDisplay) return;
   const mesh = wallDisplay.mesh;
   const position = mesh.geometry.getAttribute('position');
@@ -1300,7 +1235,7 @@ function pointOnWallRegion(region: VideoWallContentRegion): THREE.Vector3 | unde
   return mesh.localToWorld(local);
 }
 
-function focusWallRegion(region: VideoWallContentRegion): void {
+function focusWallRegion(region: WallFocusRect): void {
   if (!wallDisplay) return;
   const target = pointOnWallRegion(region);
   if (!target) return;
@@ -1322,13 +1257,11 @@ function focusWallRegion(region: VideoWallContentRegion): void {
   status.textContent = `${region.title.toUpperCase()} · WALL DETAIL`;
 }
 
-function wallSectionFocusRegion(sectionIndex: number): VideoWallContentRegion | undefined {
+function wallSectionFocusRegion(sectionIndex: number): WallFocusRect | undefined {
   if (!wallDisplay || sectionIndex < 0 || sectionIndex > 3) return;
   const { canvas } = wallDisplay;
   const sectionWidth = canvas.width / 4;
   return {
-    kind: 'terminal',
-    terminalId: `room-display-2:section-${sectionIndex + 1}`,
     title: `Main Screen Section ${sectionIndex + 1}`,
     x0: sectionIndex * sectionWidth,
     y0: 0,
@@ -1337,21 +1270,25 @@ function wallSectionFocusRegion(sectionIndex: number): VideoWallContentRegion | 
   };
 }
 
+function isWallRouterRegion(region: VideoWallRegion | undefined): region is VideoWallRouterRegion {
+  return !!region && (
+    region.kind === 'router-tab'
+    || region.kind === 'router-tab-expand'
+    || region.kind === 'router-pane'
+    || region.kind === 'router-scroll-up'
+    || region.kind === 'router-scroll-down'
+    || region.kind === 'router-close'
+  );
+}
+
 function handleWallClick(hit: THREE.Intersection): void {
   if (!wallDisplay || !hit.uv) return;
   const { canvas } = wallDisplay;
   const px = hit.uv.x * canvas.width;
   const py = (1 - hit.uv.y) * canvas.height;
   const region = videoWall.hitTest(px, py);
-  if (region && (
-    region.kind === 'router-terminal'
-    || region.kind === 'router-tab'
-    || region.kind === 'router-pane'
-    || region.kind === 'router-scroll-up'
-    || region.kind === 'router-scroll-down'
-    || region.kind === 'router-close'
-  )) {
-    videoWall.activateRouterRegion(region as VideoWallRouterRegion);
+  if (isWallRouterRegion(region)) {
+    videoWall.activateRouterRegion(region);
     status.textContent = `MAIN SCREEN · SECTION ${region.sectionIndex + 1}`;
     return;
   }
@@ -1359,11 +1296,11 @@ function handleWallClick(hit: THREE.Intersection): void {
     resetRoom();
     return;
   }
-  if (!region || (region.kind !== 'pane' && region.kind !== 'terminal')) {
+  if (!region || (region.kind !== 'pane' && region.kind !== 'tab')) {
     focusPresentationScreen();
     return;
   }
-  const contentId = region.kind === 'pane' ? `pane:${region.paneId}` : region.terminalId;
+  const contentId = region.kind === 'pane' ? `pane:${region.paneId}` : `tab:${region.tabId}`;
   if (wallZoomedContentId === contentId) {
     focusPresentationScreen();
     return;
@@ -1387,9 +1324,10 @@ function routeWallPointer(hit: THREE.Intersection): void {
   const px = hit.uv.x * wallDisplay.canvas.width;
   const py = (1 - hit.uv.y) * wallDisplay.canvas.height;
   const region = videoWall.hitTest(px, py);
-  // Once the physical router is visible, its controls behave like desk-HUD
-  // controls: one click dispatches immediately and never moves the camera.
-  if (videoWall.isRouterOpen() || region?.kind === 'reset') {
+  // Picker controls — permanent on disconnected sections, reopened on
+  // assigned ones — behave like desk-HUD controls: one click dispatches
+  // immediately and never moves the camera.
+  if (isWallRouterRegion(region) || region?.kind === 'reset') {
     cancelPendingWallClick();
     handleWallClick(hit);
     return;
@@ -1404,8 +1342,8 @@ function routeWallPointer(hit: THREE.Intersection): void {
     videoWall.setFocusedPane(undefined);
     const focusRegion = wallSectionFocusRegion(sectionIndex);
     if (focusRegion) focusWallRegion(focusRegion);
-    console.info('main-screen-pane-picker-opened', { sectionIndex: sectionIndex + 1, input: 'pointer-pair' });
-    status.textContent = `MAIN SCREEN · SECTION ${sectionIndex + 1} PANE PICKER`;
+    console.info('main-screen-source-picker-opened', { sectionIndex: sectionIndex + 1, input: 'pointer-pair' });
+    status.textContent = `MAIN SCREEN · SECTION ${sectionIndex + 1} SOURCE PICKER`;
     return;
   }
   if (pendingWallClick) {
@@ -1565,7 +1503,7 @@ function renderPoweredOff(session: MonitorSession): void {
 function initializeStationSessions(station: DeskStation): void {
   station.sessions.forEach((session, i) => {
     session.powered = station.restoredPower[i];
-    if (session.powered) renderMonitorBoot(session, station, i + 1, session.generation);
+    if (session.powered) renderMonitorPicker(session, station, i + 1);
     else renderPoweredOff(session);
   });
 }
@@ -1596,7 +1534,7 @@ function refreshSessionRaster(session: MonitorSession, desk: DeskStation, index:
   // /ws/tab socket, not a pane stream. Without this guard every topology
   // refresh painted the boot card over the tab a few seconds after connecting.
   else if (tabStreams.has(`${desk.id}:${index}`)) dirtyTabStreams.add(`${desk.id}:${index}`);
-  else if (!session.paneId) renderMonitorBoot(session, desk, index, session.generation);
+  else if (!session.paneId) renderMonitorPicker(session, desk, index);
 }
 
 
@@ -1607,9 +1545,20 @@ const BOOT_PALETTE = {
   top: '#04141d', bottom: '#01070b', rule: '#13495e', label: '#4e91a9',
   bright: '#d7f8ff', accent: '#40dcff', ok: '#3ce49a', warn: '#ffb454', fail: '#ff4b59',
 };
-const BOOT_REVEAL_STEP = .11;
-const BOOT_SETTLE = .45;
-const BOOT_BLINK = .53;
+
+type MonitorPickerRegion = {
+  kind: 'tab' | 'pane' | 'scroll-up' | 'scroll-down';
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  tabId?: string;
+  paneId?: string;
+};
+// Keyed by `${deskId}:${index}` like tabStreams. Regions are canvas-space and
+// only honored while the bay is still powered and source-less.
+const monitorPickerRegions = new Map<string, MonitorPickerRegion[]>();
+const monitorPickerScroll = new Map<string, number>();
 
 // The WebGL RENDERER string is routinely 70+ characters and used to run off the
 // right edge of the panel. Every value on the boot screen is clipped to its cell.
@@ -1620,159 +1569,175 @@ function truncateToWidth(ctx: CanvasRenderingContext2D, text: string, maxWidth: 
   return `${text.slice(0, end)}…`;
 }
 
-function renderMonitorBoot(session: MonitorSession, desk: DeskStation, index: number, generation: number): void {
+/**
+ * Idle state for a powered, source-less bay: the source picker painted on the
+ * glass itself. Lists every discovered tab (whole-tab binding) and its panes;
+ * clicking a row routes content through the same connect paths the desk HUD
+ * uses. Replaces the old POST/boot screen.
+ */
+function renderMonitorPicker(session: MonitorSession, desk: DeskStation, index: number): void {
   session.source = { kind: 'boot' };
-  const started = performance.now();
-  let paintedPhase = -2;
-  const epoch = session.rasterEpoch;
-
-  const paint = (now: number) => {
-    if (!session.powered || session.generation !== generation || session.paneId || session.rasterEpoch !== epoch) return;
-    const elapsed = (now - started) / 1000;
-    const online = diagnostics.hyperiaOnline;
-    const specs = [
-      { label: 'DISPLAY', value: diagnostics.webgl ? 'OK' : 'FAILED', tone: diagnostics.webgl ? BOOT_PALETTE.ok : BOOT_PALETTE.fail },
-      { label: 'RENDERER', value: diagnostics.gpu, tone: BOOT_PALETTE.label },
-      { label: 'HYPERIA', value: online ? diagnostics.hyperiaVersion : 'OFFLINE', tone: online ? BOOT_PALETTE.ok : BOOT_PALETTE.fail },
-    ];
-    const booting = elapsed < (specs.length + 2) * BOOT_REVEAL_STEP + BOOT_SETTLE;
-    // Once the sequence settles only the caret changes. Repaint on its blink
-    // instead of every frame, or eight idle panels upload eight 1440x900
-    // textures per frame to animate a flashing block.
-    const phase = booting ? -1 : Math.floor(elapsed / BOOT_BLINK);
-    if (!booting && phase === paintedPhase) { requestAnimationFrame(paint); return; }
-    paintedPhase = phase;
-
-    // Designed as 16:10. Letterbox that card into the real panel so a 21:9
-    // ultrawide does not stretch the POST horizontally.
-    const frame = sessionContentRect(session);
-    const ctx = session.canvas.getContext('2d')!;
-    fillBezel(ctx, session.canvas, BOOT_PALETTE.bottom);
-    const { width, height } = { width: frame.width, height: frame.height };
-    const unit = height / 900;
-    const padX = frame.x + 104 * unit;
-    const contentWidth = width - 208 * unit;
-    const titleH = 52 * unit, ruleH = 30 * unit, stationH = 86 * unit;
-    const gapH = 30 * unit, specH = 56 * unit, statusH = 52 * unit;
-    const blockH = titleH + ruleH + stationH + gapH + specH * specs.length + gapH + ruleH + statusH;
-    const font = (size: number, weight = '') => `${weight} ${Math.round(size * unit)}px "Cascadia Mono", Consolas, monospace`.trim();
-    const revealed = (row: number) => elapsed >= row * BOOT_REVEAL_STEP;
-    const typed = (row: number, text: string) => {
-      const progress = (elapsed - row * BOOT_REVEAL_STEP) / BOOT_REVEAL_STEP;
-      return progress >= 1 ? text : text.slice(0, Math.max(1, Math.ceil(text.length * progress)));
-    };
-
-    const backdrop = ctx.createLinearGradient(0, frame.y, 0, frame.y + height);
-    backdrop.addColorStop(0, BOOT_PALETTE.top); backdrop.addColorStop(1, BOOT_PALETTE.bottom);
-    ctx.fillStyle = backdrop; ctx.fillRect(frame.x, frame.y, width, height);
-    ctx.textBaseline = 'top'; ctx.textAlign = 'left';
-    let y = frame.y + Math.round((height - blockH) / 2);
-
-    ctx.font = font(30, '600'); ctx.fillStyle = BOOT_PALETTE.label;
-    ctx.fillText('OPS ROOM TERMINAL', padX, y);
-    ctx.textAlign = 'right'; ctx.fillText(`BUILD ${diagnostics.appVersion}`, frame.x + width - 104 * unit, y); ctx.textAlign = 'left';
-    y += titleH;
-    ctx.fillStyle = BOOT_PALETTE.rule; ctx.fillRect(padX, y, contentWidth, Math.max(1, 2 * unit));
-    y += ruleH;
-
-    if (revealed(0)) {
-      ctx.font = font(52, '700'); ctx.fillStyle = BOOT_PALETTE.bright;
-      ctx.shadowColor = BOOT_PALETTE.accent; ctx.shadowBlur = 18 * unit;
-      ctx.fillText(typed(0, truncateToWidth(ctx, `${desk.label.toUpperCase()} · DISPLAY ${index}`, contentWidth)), padX, y);
-      ctx.shadowBlur = 0;
-    }
-    y += stationH + gapH;
-
-    const valueX = padX + Math.min(300 * unit, contentWidth * .34);
-    ctx.font = font(29);
-    specs.forEach((spec, i) => {
-      if (revealed(1 + i)) {
-        ctx.fillStyle = BOOT_PALETTE.label; ctx.fillText(spec.label, padX, y);
-        ctx.fillStyle = spec.tone;
-        ctx.fillText(typed(1 + i, truncateToWidth(ctx, spec.value, frame.x + width - 104 * unit - valueX)), valueX, y);
-      }
-      y += specH;
-    });
-    y += gapH;
-    ctx.fillStyle = BOOT_PALETTE.rule; ctx.fillRect(padX, y, contentWidth, Math.max(1, 2 * unit));
-    y += ruleH;
-
-    const statusRow = 1 + specs.length;
-    if (revealed(statusRow)) {
-      ctx.font = font(30); ctx.fillStyle = online ? BOOT_PALETTE.accent : BOOT_PALETTE.warn;
-      const message = online ? 'NO SOURCE · SELECT A PANE ON THE DESK PANEL' : 'WAITING FOR HYPERIA';
-      const shown = typed(statusRow, truncateToWidth(ctx, message, contentWidth - 34 * unit));
-      ctx.fillText(shown, padX, y);
-      if (booting || phase % 2 === 0) ctx.fillRect(padX + ctx.measureText(shown).width + 9 * unit, y + 3 * unit, 15 * unit, 30 * unit);
-    }
-
-    ctx.globalAlpha = .05; ctx.fillStyle = '#000000';
-    for (let line = 0; line < session.canvas.height; line += 4 * unit) ctx.fillRect(0, line, session.canvas.width, Math.max(1, unit));
-    ctx.globalAlpha = 1;
-    const vignette = ctx.createRadialGradient(session.canvas.width / 2, session.canvas.height / 2, session.canvas.height * .25, session.canvas.width / 2, session.canvas.height / 2, session.canvas.height * .85);
-    vignette.addColorStop(0, 'rgba(0,0,0,0)'); vignette.addColorStop(1, 'rgba(0,0,0,.55)');
-    ctx.fillStyle = vignette; ctx.fillRect(0, 0, session.canvas.width, session.canvas.height);
-
-    session.texture.needsUpdate = true;
-    requestAnimationFrame(paint);
-  };
-  requestAnimationFrame(paint);
-}
-
-function renderTerminalPlaceholder(session: MonitorSession, terminal: TerminalDefinition): void {
+  const key = tabStreamKey(desk.id, index);
+  const regions: MonitorPickerRegion[] = [];
+  const frame = sessionContentRect(session);
   const ctx = session.canvas.getContext('2d')!;
-  fillBezel(ctx, session.canvas, '#010407');
-  const image = terminalImages.get(terminal.id);
-  if (!image?.complete || !image.naturalWidth || !image.naturalHeight) {
-    ctx.fillStyle = '#a7d79a';
-    ctx.font = `${Math.max(18, Math.round(session.canvas.height * .035))}px "Cascadia Mono", Consolas, monospace`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(`LOADING ${terminal.label}`, session.canvas.width / 2, session.canvas.height / 2);
-  } else {
-    const scale = Math.min(
-      session.canvas.width / image.naturalWidth,
-      session.canvas.height / image.naturalHeight,
-    );
-    const width = image.naturalWidth * scale;
-    const height = image.naturalHeight * scale;
-    ctx.drawImage(
-      image,
-      (session.canvas.width - width) / 2,
-      (session.canvas.height - height) / 2,
-      width,
-      height,
-    );
+  fillBezel(ctx, session.canvas, BOOT_PALETTE.bottom);
+  const unit = frame.height / 900;
+  const padX = frame.x + 104 * unit;
+  const contentWidth = frame.width - 208 * unit;
+  const font = (size: number, weight = '') => `${weight} ${Math.round(size * unit)}px "Cascadia Mono", Consolas, monospace`.trim();
+
+  const backdrop = ctx.createLinearGradient(0, frame.y, 0, frame.y + frame.height);
+  backdrop.addColorStop(0, BOOT_PALETTE.top);
+  backdrop.addColorStop(1, BOOT_PALETTE.bottom);
+  ctx.fillStyle = backdrop;
+  ctx.fillRect(frame.x, frame.y, frame.width, frame.height);
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'left';
+
+  let y = frame.y + 44 * unit;
+  ctx.font = font(30, '600');
+  ctx.fillStyle = BOOT_PALETTE.label;
+  ctx.fillText('OPS ROOM TERMINAL', padX, y);
+  ctx.textAlign = 'right';
+  ctx.fillText(`BUILD ${diagnostics.appVersion}`, frame.x + frame.width - 104 * unit, y);
+  ctx.textAlign = 'left';
+  y += 52 * unit;
+  ctx.font = font(44, '700');
+  ctx.fillStyle = BOOT_PALETTE.bright;
+  ctx.shadowColor = BOOT_PALETTE.accent;
+  ctx.shadowBlur = 18 * unit;
+  ctx.fillText(truncateToWidth(ctx, `${desk.label.toUpperCase()} · DISPLAY ${index} · SELECT SOURCE`, contentWidth), padX, y);
+  ctx.shadowBlur = 0;
+  y += 74 * unit;
+  ctx.fillStyle = BOOT_PALETTE.rule;
+  ctx.fillRect(padX, y, contentWidth, Math.max(1, 2 * unit));
+  y += 26 * unit;
+
+  const rows: Array<{ kind: 'tab'; tab: TabGroup } | { kind: 'pane'; pane: PaneInfo }> = [];
+  for (const tab of discoveredTabs) {
+    rows.push({ kind: 'tab', tab });
+    tab.panes.forEach(pane => rows.push({ kind: 'pane', pane }));
   }
-  session.live = !!image?.complete && image.naturalWidth > 0;
+
+  const listTop = y;
+  const listBottom = frame.y + frame.height - 44 * unit;
+  const rowHeight = 58 * unit;
+  const rowGap = 10 * unit;
+  const visibleRows = Math.max(1, Math.floor((listBottom - listTop + rowGap) / (rowHeight + rowGap)));
+  const maxScroll = Math.max(0, rows.length - visibleRows);
+  const scroll = Math.max(0, Math.min(monitorPickerScroll.get(key) ?? 0, maxScroll));
+  monitorPickerScroll.set(key, scroll);
+  const railWidth = maxScroll ? 70 * unit : 0;
+  const listWidth = contentWidth - (railWidth ? railWidth + 18 * unit : 0);
+
+  if (!rows.length) {
+    ctx.font = font(30);
+    ctx.fillStyle = diagnostics.hyperiaOnline ? BOOT_PALETTE.accent : BOOT_PALETTE.warn;
+    ctx.fillText(diagnostics.hyperiaOnline ? 'NO LIVE SOURCES · OPEN A HYPERIA TAB' : 'WAITING FOR HYPERIA', padX, listTop + 18 * unit);
+  }
+
+  y = listTop;
+  for (const row of rows.slice(scroll, scroll + visibleRows)) {
+    if (row.kind === 'tab') {
+      ctx.fillStyle = '#071720';
+      ctx.fillRect(padX, y, listWidth, rowHeight);
+      ctx.strokeStyle = '#17475b';
+      ctx.lineWidth = Math.max(1, 2 * unit);
+      ctx.strokeRect(padX, y, listWidth, rowHeight);
+      ctx.fillStyle = '#bcefff';
+      ctx.font = font(24);
+      ctx.fillText(truncateToWidth(ctx, `TAB  ${row.tab.name}`, listWidth - 34 * unit), padX + 17 * unit, y + rowHeight * .28);
+      regions.push({ kind: 'tab', tabId: row.tab.tabId, x0: padX, y0: y, x1: padX + listWidth, y1: y + rowHeight });
+    } else {
+      const indent = 34 * unit;
+      ctx.fillStyle = '#08111a';
+      ctx.fillRect(padX + indent, y, listWidth - indent, rowHeight);
+      ctx.strokeStyle = '#173141';
+      ctx.lineWidth = Math.max(1, 2 * unit);
+      ctx.strokeRect(padX + indent, y, listWidth - indent, rowHeight);
+      ctx.fillStyle = '#8ebbd0';
+      ctx.font = font(22);
+      const kind = row.pane.shell === 'web' ? 'WEB' : 'PTY';
+      ctx.fillText(truncateToWidth(ctx, `${kind}  ${paneCreatureName(row.pane) || row.pane.paneId.slice(0, 8)}`, listWidth - indent - 34 * unit), padX + indent + 17 * unit, y + rowHeight * .28);
+      regions.push({ kind: 'pane', paneId: row.pane.paneId, x0: padX + indent, y0: y, x1: padX + listWidth, y1: y + rowHeight });
+    }
+    y += rowHeight + rowGap;
+  }
+
+  if (maxScroll) {
+    const railX = padX + listWidth + 18 * unit;
+    const buttonHeight = 64 * unit;
+    for (const [kind, buttonY, glyph] of [
+      ['scroll-up', listTop, '▲'],
+      ['scroll-down', listBottom - buttonHeight, '▼'],
+    ] as const) {
+      ctx.fillStyle = '#0b3342';
+      ctx.fillRect(railX, buttonY, railWidth, buttonHeight);
+      ctx.strokeStyle = '#42c8ff';
+      ctx.strokeRect(railX, buttonY, railWidth, buttonHeight);
+      ctx.fillStyle = '#d7f8ff';
+      ctx.font = font(28, '700');
+      ctx.textAlign = 'center';
+      ctx.fillText(glyph, railX + railWidth / 2, buttonY + buttonHeight * .28);
+      ctx.textAlign = 'left';
+      regions.push({ kind, x0: railX, y0: buttonY, x1: railX + railWidth, y1: buttonY + buttonHeight });
+    }
+  }
+
+  ctx.globalAlpha = .05;
+  ctx.fillStyle = '#000000';
+  for (let line = 0; line < session.canvas.height; line += 4 * unit) ctx.fillRect(0, line, session.canvas.width, Math.max(1, unit));
+  ctx.globalAlpha = 1;
+  const vignette = ctx.createRadialGradient(session.canvas.width / 2, session.canvas.height / 2, session.canvas.height * .25, session.canvas.width / 2, session.canvas.height / 2, session.canvas.height * .85);
+  vignette.addColorStop(0, 'rgba(0,0,0,0)');
+  vignette.addColorStop(1, 'rgba(0,0,0,.55)');
+  ctx.fillStyle = vignette;
+  ctx.fillRect(0, 0, session.canvas.width, session.canvas.height);
+
+  monitorPickerRegions.set(key, regions);
   session.texture.needsUpdate = true;
 }
 
-function connectTerminal(desk: DeskStation, index: number, terminal: TerminalDefinition): void {
+/** True while the bay is powered but has no pane, tab, or in-flight stream. */
+function monitorShowsPicker(desk: DeskStation, index: number): boolean {
   const session = desk.sessions[index - 1];
-  if (!session) return;
-
-  disposeTabStream(desk.id, index);
-  desk.monitorTargets[index - 1] = terminal.id;
-  desk.save();
-  targetPane = terminal.id;
-  if (!session.powered) {
-    drawDeskHud(desk.id);
-    status.textContent = `${desk.label.toUpperCase()} · MONITOR ${index} · ${terminal.label.toUpperCase()} ASSIGNED · POWER OFF`;
-    return;
-  }
-
-  session.generation++;
-  session.socket?.close();
-  session.socket = undefined;
-  session.paneId = '';
-  session.source = { kind: 'terminal', terminalId: terminal.id };
-  renderTerminalPlaceholder(session, terminal);
-  streamBroker.notifyChanged(screenLeaseId(desk.id, index));
-  refreshPaneButtons();
-  drawDeskHud(desk.id);
-  status.textContent = `${desk.label.toUpperCase()} · MONITOR ${index} · ${terminal.label.toUpperCase()}`;
+  return session?.powered === true && !session.paneId && !tabStreams.has(tabStreamKey(desk.id, index));
 }
+
+/** Route a raycast uv on idle monitor glass through its painted picker. */
+function dispatchMonitorPickerClick(desk: DeskStation, index: number, uv: THREE.Vector2): boolean {
+  if (!monitorShowsPicker(desk, index)) return false;
+  const session = desk.sessions[index - 1];
+  const regions = monitorPickerRegions.get(tabStreamKey(desk.id, index));
+  if (!session || !regions?.length) return false;
+  // Mirror the panel texture transform (configurePanelTexture) so canvas
+  // hit-rects line up with what the operator actually sees on the glass.
+  const u = session.surface?.orientation.flipU ? 1 - uv.x : uv.x;
+  const v = session.surface?.orientation.flipV ? 1 - uv.y : uv.y;
+  const px = u * session.canvas.width;
+  const py = (1 - v) * session.canvas.height;
+  const region = regions.find(r => px >= r.x0 && px <= r.x1 && py >= r.y0 && py <= r.y1);
+  if (!region) return false;
+  activateDeskWithoutCamera(desk.id);
+  desk.selectMonitor(index);
+  if (region.kind === 'tab' && region.tabId) connectTabToMonitor(desk, index, region.tabId);
+  else if (region.kind === 'pane' && region.paneId) connectPaneToMonitor(desk, index, region.paneId);
+  else {
+    const key = tabStreamKey(desk.id, index);
+    monitorPickerScroll.set(key, (monitorPickerScroll.get(key) ?? 0) + (region.kind === 'scroll-down' ? 1 : -1));
+    renderMonitorPicker(session, desk, index);
+  }
+  return true;
+}
+
+/** Discovery changed: refresh the picker on every powered, source-less bay. */
+function repaintIdleMonitors(): void {
+  desks.forEach(desk => desk.sessions.forEach((session, i) => {
+    if (monitorShowsPicker(desk, i + 1)) renderMonitorPicker(session, desk, i + 1);
+  }));
+}
+
 
 function setMonitorPower(desk: DeskStation, index: number, powered: boolean, persist = true): void {
   const session = desk.sessions[index - 1]; if (!session) return;
@@ -1785,13 +1750,10 @@ function setMonitorPower(desk: DeskStation, index: number, powered: boolean, per
     const preservedTarget = desk.monitorTargets[index - 1];
     session.generation++; session.socket?.close(); session.socket = undefined; session.live = false; session.paneId = '';
     activateDeskWithoutCamera(desk.id); desk.selectMonitor(index);
-    targetPane = preservedTarget;
-    const terminal = terminalById(preservedTarget);
     const tabId = tabIdFromBinding(preservedTarget);
-    if (terminal) connectTerminal(desk, index, terminal);
-    else if (tabId) attachTabStream(desk, index, tabId);
+    if (tabId) attachTabStream(desk, index, tabId);
     else if (preservedTarget && discoveredPanes.some(pane => pane.paneId === preservedTarget)) connectPaneToMonitor(desk, index, preservedTarget);
-    else renderMonitorBoot(session, desk, index, session.generation);
+    else renderMonitorPicker(session, desk, index);
   }
   if (persist) desk.save();
   streamBroker.notifyChanged(screenLeaseId(desk.id, index));
@@ -1799,12 +1761,12 @@ function setMonitorPower(desk: DeskStation, index: number, powered: boolean, per
   status.textContent = `${desk.label.toUpperCase()} · MONITOR ${index} · ${powered ? 'POWER ON' : 'POWER OFF'}`;
 }
 
-function returnMonitorToBoot(desk: DeskStation, index: number): void {
+function returnMonitorToIdle(desk: DeskStation, index: number): void {
   const session = desk.sessions[index - 1]; if (!session?.powered) return;
   disposeTabStream(desk.id, index);
   session.generation++; session.socket?.close(); session.socket = undefined; session.live = false; session.paneId = '';
   desk.monitorTargets[index - 1] = ''; desk.save();
-  renderMonitorBoot(session, desk, index, session.generation);
+  renderMonitorPicker(session, desk, index);
   drawDeskHud(desk.id);
 }
 
@@ -1817,7 +1779,7 @@ function reconcileMonitorSources(): void {
     // A tab is a first-class source, not a pane id. Keep its binding even when
     // topology briefly omits the tab (restart/background transition) so its
     // socket can recover without destroying the operator's saved setup.
-    if (paneId && !terminalById(paneId) && !tabIdFromBinding(paneId) && !available.has(paneId)) returnMonitorToBoot(desk, i + 1);
+    if (paneId && !tabIdFromBinding(paneId) && !available.has(paneId)) returnMonitorToIdle(desk, i + 1);
   }));
 }
 
@@ -1833,9 +1795,11 @@ AssetCache.getInstance().instantiate('/assets/standing_desk_sim_master.glb').the
     node.castShadow = true; node.receiveShadow = true;
     const monitorMatch = node.name.match(/_(2|3)$/);
     if (monitorMatch && !node.name.startsWith('MonScreen_')) {
-      const index = Number(monitorMatch[1]) - 2;
-      monitorShells[index].push(node);
-      applyFacetMode(index);
+      // The desk-1 shells always rendered faceted: the FX toggle lived in the
+      // retired DOM picker and was unreachable. Keep the look, drop the knob.
+      const material = node.material as THREE.MeshStandardMaterial;
+      material.flatShading = true;
+      material.needsUpdate = true;
     }
     if (node.name === 'Desk_Wood_Top') {
       const source = node.material as THREE.MeshStandardMaterial;
@@ -2249,10 +2213,8 @@ function restoreStationConnections(): void {
     const sourceId = desk.monitorTargets[i];
     if (!session.powered || !sourceId) return;
     selectedDeskId = desk.id; desk.selectMonitor(i + 1);
-    const terminal = terminalById(sourceId);
     const tabId = tabIdFromBinding(sourceId);
-    if (terminal) connectTerminal(desk, i + 1, terminal);
-    else if (tabId) attachTabStream(desk, i + 1, tabId);
+    if (tabId) attachTabStream(desk, i + 1, tabId);
     else if (discoveredPanes.some(pane => pane.paneId === sourceId)) connectPaneToMonitor(desk, i + 1, sourceId);
     else unresolvedRemoteSource = true;
   });
@@ -2285,30 +2247,14 @@ async function refreshStatusTopology(): Promise<void> {
     desks.forEach(desk => {
       if (!discoveredTabs.some(tab => tab.tabId === desk.expandedTabId)) desk.expandedTabId = '';
     });
-    refreshPaneButtons(); drawAllDeskHuds();
+    drawAllDeskHuds();
+    repaintIdleMonitors();
     restoreStationConnections();
   } catch (error) {
     console.warn('Hyperia status topology unavailable', error);
   }
 }
 
-function refreshPaneButtons(): void {
-  paneButtons.replaceChildren(...discoveredPanes.map((pane) => {
-    const button = document.createElement('button');
-    button.className = pane.paneId === targetPane ? 'pane-button active' : 'pane-button';
-    button.type = 'button';
-    button.innerHTML = `<span>${paneCreatureName(pane) || pane.paneId.slice(0, 8)}</span><small>${pane.state} · ${pane.cols}×${pane.rows}</small>`;
-    button.addEventListener('click', () => connectFocused(pane.paneId));
-    return button;
-  }));
-  drawAllDeskHuds();
-}
-
-function connectFocused(paneId: string): void {
-  const desk = desks.get(selectedDeskId);
-  if (!desk) return;
-  connectPaneToMonitor(desk, selectedMonitor, paneId);
-}
 
 function connectPaneToMonitor(desk: DeskStation, index: number, paneId: string): void {
   // A stored "tab:<id>" target is a whole-tab binding, not a pane. Restore and
@@ -2338,10 +2284,6 @@ function connectPaneToMonitor(desk: DeskStation, index: number, paneId: string):
   const alreadyStreamingThisPane = sessionAlreadyStreaming(session, paneId);
   session.paneId = paneId;
   session.source = paneInfo?.shell === 'web' ? { kind: 'web-pixels', paneId } : { kind: 'pty', paneId };
-  targetPane = paneId;
-  monitorTargets[monitorIndex] = paneId;
-  localStorage.setItem(MONITOR_STORAGE_KEY, JSON.stringify(monitorTargets));
-  refreshPaneButtons();
   drawAllDeskHuds();
   refreshSessionRaster(session, desk, index);
   if (session.texture) session.texture.needsUpdate = true;
@@ -2384,7 +2326,7 @@ function handleFocusedControl(
     session.cols = Number(message.cols); session.rows = Number(message.rows);
     session.terminal.resize(session.cols, session.rows);
     const pane = discoveredPanes.find(candidate => candidate.paneId === session.paneId);
-    if (pane) { pane.cols = session.cols; pane.rows = session.rows; refreshPaneButtons(); }
+    if (pane) { pane.cols = session.cols; pane.rows = session.rows; drawAllDeskHuds(); }
     renderPtyTerminal(session);
     status.textContent = `MONITOR ${monitorIndex + 1} · RESIZED ${session.cols}×${session.rows}`;
   }
@@ -2449,7 +2391,8 @@ function ingestWallTopology(message: WallMessage | { t: string; panes?: PaneInfo
     syncVideoWallPanes();
     syncTabStreamNames();
     desks.forEach(desk => { if (!desk.expandedTabId && discoveredTabs.length) desk.expandedTabId = discoveredTabs.find(tab => tab.active)?.tabId ?? discoveredTabs[0].tabId; });
-    refreshPaneButtons(); drawAllDeskHuds();
+    drawAllDeskHuds();
+    repaintIdleMonitors();
   }
   if (message.t === 'panes' && 'panes' in message && message.panes) {
     const liveById = new Map(discoveredPanes.map(pane => [pane.paneId, pane]));
@@ -2460,11 +2403,12 @@ function ingestWallTopology(message: WallMessage | { t: string; panes?: PaneInfo
         return normalizeDiscoveredPane({ ...live, ...pane, name });
       })
       .filter(isDeskHudPane)
-      .sort((a, b) => Number(b.paneId === targetPane) - Number(a.paneId === targetPane) || paneCreatureName(a).localeCompare(paneCreatureName(b)));
+      .sort((a, b) => paneCreatureName(a).localeCompare(paneCreatureName(b)));
     syncVideoWallPanes();
     syncTabStreamNames();
     reconcileMonitorSources();
-    refreshPaneButtons();
+    drawAllDeskHuds();
+    repaintIdleMonitors();
     restoreStationConnections();
   }
 }
@@ -2529,7 +2473,6 @@ function frame(now: number): void {
   streamBroker.tick(camera);
   paintDirtyTabStreams();
   updateCelestialHud(now);
-  panePicker.style.display = 'none';
   renderer.render(scene, camera);
   systemLoad.update(now, renderer);
   requestAnimationFrame(frame);

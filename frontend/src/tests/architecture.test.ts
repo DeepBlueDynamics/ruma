@@ -3,6 +3,7 @@ import { describe, it } from 'vitest';
 import { AssetCache } from '../assets/cache';
 import { BootSource, OffSource } from '../content/source';
 import { RoomDescriptor, validateRoomDescriptor } from '../descriptors/room-descriptor';
+import { normalizeSectionSources, WALL_SECTION_COUNT } from '../display/section-source';
 import { cssColor, normalizeCell, normalizeGridRows, paneChrome } from '../hyperia/protocol';
 import { packTabTiles } from '../hyperia/tab-stream';
 import { panoramicTheaterRoom } from '../config/rooms/panoramic-theater';
@@ -97,6 +98,35 @@ export const architectureChecks: Check[] = [
       assert(panoramicTheaterRoom.stationBays['operator-desk-1'] === 2, 'desk-1 is two monitors');
       assert(panoramicTheaterRoom.stationBays['operator-desk-2'] === 4, 'desk-2 is four monitors');
       assert(panoramicTheaterRoom.stationBays['operator-desk-3'] === 2, 'desk-3 is two monitors');
+    },
+  },
+  {
+    name: 'Wall sections restore as the pane/tab/null source union',
+    run: () => {
+      // Legacy placeholder-catalog blobs ('terminal:*') must degrade to a
+      // disconnected (picker) section — never crash, never survive as a source.
+      const migrated = normalizeSectionSources([
+        { kind: 'terminal', terminalId: 'terminal:legacy.left' },
+        { kind: 'pane', paneId: 'pane-a' },
+        { kind: 'tab', tabId: 'tab-b' },
+        { kind: 'terminal', terminalId: 'terminal:legacy.war' },
+      ]);
+      assert(migrated.length === WALL_SECTION_COUNT, 'sections are always 4 slots');
+      assert(migrated[0] === null, 'legacy terminal entry must migrate to disconnected');
+      assert(migrated[1]?.kind === 'pane' && migrated[1].paneId === 'pane-a', 'pane source survives');
+      assert(migrated[2]?.kind === 'tab' && migrated[2].tabId === 'tab-b', 'tab source survives');
+      assert(migrated[3] === null, 'legacy terminal entry must migrate to disconnected');
+    },
+  },
+  {
+    name: 'Wall sections seed four disconnected slots',
+    run: () => {
+      assert(WALL_SECTION_COUNT === 4, 'main screen has four sections');
+      const seeded = normalizeSectionSources(null);
+      assert(seeded.length === 4 && seeded.every(source => source === null), 'fresh seed is four disconnected sections');
+      const garbage = normalizeSectionSources([{ kind: 'pane' }, 'nonsense', 17, { kind: 'tab', tabId: '' }, { kind: 'pane', paneId: 'extra' }]);
+      assert(garbage.length === 4, 'oversized blobs clamp to four slots');
+      assert(garbage.every(source => source === null), 'malformed entries degrade to disconnected');
     },
   },
   {

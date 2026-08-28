@@ -1,7 +1,8 @@
 import { Terminal } from '@xterm/xterm';
 import { cssColor, wallRowPayload, type Cell, type Color, type Cursor, type GridRow, type WallMessage } from '../hyperia/protocol';
 import { hyperiaWsUrl, openContentSocket, type StreamSession } from '../hyperia/stream';
-import type { TerminalDefinition } from '../terminal/catalog';
+import { TabStream } from '../hyperia/tab-stream';
+import { normalizeSectionSources, WALL_SECTION_COUNT, type SectionSource } from './section-source';
 import type { DisplaySurface } from './surface';
 
 export type VideoWallPane = {
@@ -15,6 +16,10 @@ export type VideoWallPane = {
   shell?: string;
   cwd?: string;
   active?: boolean;
+  bspX?: number;
+  bspY?: number;
+  bspW?: number;
+  bspH?: number;
 };
 
 export type VideoWallPaneRegion = {
@@ -27,9 +32,9 @@ export type VideoWallPaneRegion = {
   y1: number;
 };
 
-export type VideoWallTerminalRegion = {
-  kind: 'terminal';
-  terminalId: string;
+export type VideoWallTabRegion = {
+  kind: 'tab';
+  tabId: string;
   title: string;
   x0: number;
   y0: number;
@@ -37,7 +42,7 @@ export type VideoWallTerminalRegion = {
   y1: number;
 };
 
-export type VideoWallContentRegion = VideoWallPaneRegion | VideoWallTerminalRegion;
+export type VideoWallContentRegion = VideoWallPaneRegion | VideoWallTabRegion;
 
 export type VideoWallTabGroup = {
   tabId: string;
@@ -46,13 +51,12 @@ export type VideoWallTabGroup = {
 };
 
 export type VideoWallRouterRegion = {
-  kind: 'router-terminal' | 'router-tab' | 'router-pane' | 'router-scroll-up' | 'router-scroll-down' | 'router-close';
+  kind: 'router-tab' | 'router-tab-expand' | 'router-pane' | 'router-scroll-up' | 'router-scroll-down' | 'router-close';
   sectionIndex: number;
   x0: number;
   y0: number;
   x1: number;
   y1: number;
-  terminalId?: string;
   tabId?: string;
   paneId?: string;
 };
@@ -67,15 +71,18 @@ export type VideoWallResetRegion = {
 
 export type VideoWallRegion = VideoWallContentRegion | VideoWallResetRegion | VideoWallRouterRegion;
 
-type SectionSource =
-  | { kind: 'terminal'; terminalId: string }
-  | { kind: 'pane'; paneId: string };
-
 type RouterState = {
-  sectionIndex: number;
   expandedTabId: string;
   scroll: number;
 };
+
+type SectionTabView = {
+  tabId: string;
+  stream: TabStream;
+  canvas: HTMLCanvasElement;
+  dirty: boolean;
+};
+
 
 type PaneView = VideoWallPane & {
   cursor: Cursor;
@@ -153,8 +160,7 @@ function truncate(ctx: CanvasRenderingContext2D, value: string, width: number): 
 export class VideoWallController {
   private static readonly sectionStorageKey = 'ops-room/room-display-2/sections-v1';
   private surface?: DisplaySurface;
-  private readonly terminals = new Map<string, { terminal: TerminalDefinition; image: HTMLImageElement }>();
-  private readonly sectionSources: Array<SectionSource | undefined>;
+  private readonly sectionSources: SectionSource[];
   private readonly views = new Map<string, PaneView>();
   /** Last wall raster per pane, kept even when the section is not showing it. */
   private readonly frameCache = new Map<string, CachedFrame>();
@@ -162,11 +168,14 @@ export class VideoWallController {
   private lastResyncAt = 0;
   private availablePanes: VideoWallPane[] = [];
   private tabs: VideoWallTabGroup[] = [];
-  private order: string[] = [];
+  /** One live `/ws/tab` composition per tab-bound section. */
+  private readonly sectionTabs = new Map<number, SectionTabView>();
   private regions: VideoWallRegion[] = [];
   private resetRegion?: VideoWallResetRegion;
   private focusedPaneId?: string;
-  private router?: RouterState;
+  /** Explicitly opened picker on an assigned section. Disconnected sections always show theirs. */
+  private openRouterIndex?: number;
+  private readonly routers = new Map<number, RouterState>();
   private renderQueued = false;
 
   constructor() {
@@ -207,86 +216,92 @@ export class VideoWallController {
     view.hasFrame = cache.hasFrame;
   }
 
-  setTerminalCatalog(terminals: readonly TerminalDefinition[]): void {
-    for (const terminal of terminals) this.registerTerminal(terminal);
-    this.scheduleRender();
-  }
-
   setTabGroups(tabs: VideoWallTabGroup[]): void {
     this.tabs = tabs.map(tab => ({ ...tab, panes: [...tab.panes] }));
-    if (this.router && !this.tabs.some(tab => tab.tabId === this.router!.expandedTabId)) {
-      this.router.expandedTabId = '';
-      this.router.scroll = 0;
+    for (const router of this.routers.values()) {
+      if (router.expandedTabId && !this.tabs.some(tab => tab.tabId === router.expandedTabId)) {
+        router.expandedTabId = '';
+        router.scroll = 0;
+      }
     }
+    for (const view of this.sectionTabs.values()) this.rememberTabNames(view);
     this.scheduleRender();
   }
 
-  setSectionTerminal(sectionIndex: number, terminal: TerminalDefinition): void {
-    if (!Number.isInteger(sectionIndex) || sectionIndex < 0 || sectionIndex > 2) {
-      throw new RangeError(`Room-display section index ${sectionIndex} is outside 0..2`);
+  setSectionSource(sectionIndex: number, source: SectionSource): void {
+    if (!Number.isInteger(sectionIndex) || sectionIndex < 0 || sectionIndex >= WALL_SECTION_COUNT) {
+      throw new RangeError(`Room-display section index ${sectionIndex} is outside 0..${WALL_SECTION_COUNT - 1}`);
     }
-    this.registerTerminal(terminal);
-    // Calls during startup establish defaults only. A persisted user choice is
-    // authoritative and must survive reloads.
-    if (this.sectionSources[sectionIndex]) return;
-    this.sectionSources[sectionIndex] = { kind: 'terminal', terminalId: terminal.id };
-    this.rebuildViews();
+    this.assignSection(sectionIndex, source);
     this.scheduleRender();
+  }
+
+  sectionSourcesSnapshot(): SectionSource[] {
+    return [...this.sectionSources];
   }
 
   openSectionRouter(sectionIndex: number): void {
-    if (!Number.isInteger(sectionIndex) || sectionIndex < 0 || sectionIndex > 2) return;
-    this.router = { sectionIndex, expandedTabId: '', scroll: 0 };
+    if (!Number.isInteger(sectionIndex) || sectionIndex < 0 || sectionIndex >= WALL_SECTION_COUNT) return;
+    this.openRouterIndex = sectionIndex;
     this.scheduleRender();
   }
 
-  isRouterOpen(): boolean { return !!this.router; }
+  /** A section paints its picker when disconnected or explicitly reopened. */
+  private sectionShowsRouter(sectionIndex: number): boolean {
+    return this.openRouterIndex === sectionIndex || !this.sectionSources[sectionIndex];
+  }
+
+  private routerStateFor(sectionIndex: number): RouterState {
+    let state = this.routers.get(sectionIndex);
+    if (!state) {
+      state = { expandedTabId: '', scroll: 0 };
+      this.routers.set(sectionIndex, state);
+    }
+    return state;
+  }
 
   sectionIndexAt(x: number, y: number): number | undefined {
     const metrics = this.sectionMetrics();
     if (!metrics) return;
     const { outer, gap, sectionWidth, sectionHeight } = metrics;
     if (y < outer || y > outer + sectionHeight) return;
-    for (let section = 0; section < 4; section++) {
+    for (let section = 0; section < WALL_SECTION_COUNT; section++) {
       const start = outer + section * (sectionWidth + gap);
       if (x >= start && x <= start + sectionWidth) return section;
     }
   }
 
   activateRouterRegion(region: VideoWallRouterRegion): void {
-    if (!this.router || region.sectionIndex !== this.router.sectionIndex) return;
+    if (!this.sectionShowsRouter(region.sectionIndex)) return;
+    const router = this.routerStateFor(region.sectionIndex);
     if (region.kind === 'router-close') {
-      this.router = undefined;
-    } else if (region.kind === 'router-tab' && region.tabId) {
-      this.router.expandedTabId = this.router.expandedTabId === region.tabId ? '' : region.tabId;
-      this.router.scroll = 0;
+      if (this.openRouterIndex === region.sectionIndex) this.openRouterIndex = undefined;
+    } else if (region.kind === 'router-tab-expand' && region.tabId) {
+      router.expandedTabId = router.expandedTabId === region.tabId ? '' : region.tabId;
+      router.scroll = 0;
     } else if (region.kind === 'router-scroll-up') {
-      this.router.scroll = Math.max(0, this.router.scroll - 1);
+      router.scroll = Math.max(0, router.scroll - 1);
     } else if (region.kind === 'router-scroll-down') {
-      this.router.scroll++;
-    } else if (region.kind === 'router-terminal' && region.terminalId && this.terminals.has(region.terminalId)) {
-      this.sectionSources[region.sectionIndex] = { kind: 'terminal', terminalId: region.terminalId };
-      this.persistSectionSources();
-      console.info('main-screen-source-assigned', { sectionIndex: region.sectionIndex + 1, kind: 'terminal', sourceId: region.terminalId });
-      this.router = undefined;
-      this.rebuildViews();
+      router.scroll++;
+    } else if (region.kind === 'router-tab' && region.tabId) {
+      this.assignSection(region.sectionIndex, { kind: 'tab', tabId: region.tabId });
     } else if (region.kind === 'router-pane' && region.paneId) {
-      this.sectionSources[region.sectionIndex] = { kind: 'pane', paneId: region.paneId };
-      this.persistSectionSources();
-      console.info('main-screen-source-assigned', { sectionIndex: region.sectionIndex + 1, kind: 'pane', sourceId: region.paneId });
-      this.router = undefined;
-      this.rebuildViews();
+      this.assignSection(region.sectionIndex, { kind: 'pane', paneId: region.paneId });
     }
     this.scheduleRender();
   }
 
-  private registerTerminal(terminal: TerminalDefinition): void {
-    if (this.terminals.has(terminal.id)) return;
-    const image = new Image();
-    image.decoding = 'async';
-    image.addEventListener('load', () => this.scheduleRender());
-    image.src = terminal.adapter.asset;
-    this.terminals.set(terminal.id, { terminal, image });
+  private assignSection(sectionIndex: number, source: SectionSource): void {
+    this.sectionSources[sectionIndex] = source;
+    this.persistSectionSources();
+    console.info('main-screen-source-assigned', {
+      sectionIndex: sectionIndex + 1,
+      kind: source?.kind ?? 'none',
+      sourceId: source?.kind === 'pane' ? source.paneId : source?.kind === 'tab' ? source.tabId : '',
+    });
+    if (this.openRouterIndex === sectionIndex) this.openRouterIndex = undefined;
+    this.routers.delete(sectionIndex);
+    this.rebuildViews();
   }
 
   setPanes(panes: VideoWallPane[]): void {
@@ -295,26 +310,11 @@ export class VideoWallController {
   }
 
   private rebuildViews(): void {
-    // Explicit section assignments win. Any still-unconfigured section may use
-    // the next discovered pane as its live default, without persisting that
-    // incidental discovery order as user configuration.
-    const explicit = this.sectionSources
-      .filter((source): source is Extract<SectionSource, { kind: 'pane' }> => source?.kind === 'pane')
-      .map(source => source.paneId);
-    const fallback = this.availablePanes
-      .map(pane => pane.paneId)
-      .filter(paneId => !explicit.includes(paneId));
-    const visibleIds: string[] = [];
-    let fallbackIndex = 0;
-    for (let section = 0; section < 4; section++) {
-      const source = this.sectionSources[section];
-      if (source?.kind === 'pane') visibleIds.push(source.paneId);
-      else if (!source) {
-        const paneId = fallback[fallbackIndex++];
-        if (paneId) visibleIds.push(paneId);
-      }
-    }
-    const present = new Set(visibleIds);
+    // Only explicit assignments stream. A disconnected section paints its
+    // picker instead of borrowing the next discovered pane.
+    const present = new Set(
+      this.sectionSources.flatMap(source => (source?.kind === 'pane' ? [source.paneId] : [])),
+    );
     for (const [paneId, view] of this.views) {
       if (present.has(paneId)) continue;
       this.releasePaneStream(view);
@@ -322,7 +322,7 @@ export class VideoWallController {
       if (this.focusedPaneId === paneId) this.focusedPaneId = undefined;
     }
 
-    for (const paneId of visibleIds) {
+    for (const paneId of present) {
       const pane = this.availablePanes.find(candidate => candidate.paneId === paneId);
       const cols = Math.max(1, pane?.cols || 120);
       const rows = Math.max(1, pane?.rows || 40);
@@ -357,8 +357,43 @@ export class VideoWallController {
       this.syncPaneStream(view);
     }
 
-    this.order = visibleIds;
+    this.syncSectionTabs();
     this.scheduleRender();
+  }
+
+  private rememberTabNames(view: SectionTabView): void {
+    const tab = this.tabs.find(candidate => candidate.tabId === view.tabId);
+    if (tab) view.stream.rememberNames(tab.panes);
+  }
+
+  /** Open/retire one `/ws/tab` composition per tab-bound section. */
+  private syncSectionTabs(): void {
+    for (let section = 0; section < WALL_SECTION_COUNT; section++) {
+      const source = this.sectionSources[section];
+      const tabId = source?.kind === 'tab' ? source.tabId : undefined;
+      const existing = this.sectionTabs.get(section);
+      if (existing?.tabId === tabId) continue;
+      if (existing) {
+        existing.stream.dispose();
+        this.sectionTabs.delete(section);
+      }
+      if (!tabId) continue;
+      const canvas = document.createElement('canvas');
+      canvas.width = 1440;
+      canvas.height = 900;
+      const view: SectionTabView = {
+        tabId,
+        canvas,
+        dirty: false,
+        stream: new TabStream(tabId, canvas, () => {
+          view.dirty = true;
+          this.scheduleRender();
+        }),
+      };
+      this.rememberTabNames(view);
+      this.sectionTabs.set(section, view);
+      view.stream.connect();
+    }
   }
 
   handleMessage(message: WallMessage): void {
@@ -373,7 +408,6 @@ export class VideoWallController {
       if (view) this.releasePaneStream(view);
       this.views.delete(message.paneId);
       this.frameCache.delete(message.paneId);
-      this.order = this.order.filter(id => id !== message.paneId);
       if (this.focusedPaneId === message.paneId) this.focusedPaneId = undefined;
       this.scheduleRender();
       return;
@@ -463,61 +497,33 @@ export class VideoWallController {
     const { outer, gap, sectionWidth, sectionHeight } = metrics;
     const header = Math.max(26, Math.min(48, Math.round(sectionHeight * .065)));
     this.regions = [];
-    let paneIndex = 0;
 
-    for (let section = 0; section < 4; section++) {
+    for (let section = 0; section < WALL_SECTION_COUNT; section++) {
       const x = outer + section * (sectionWidth + gap);
       const y = outer;
       const source = this.sectionSources[section];
-      const paneId = source?.kind === 'pane'
-        ? this.order[paneIndex++]
-        : source ? undefined : this.order[paneIndex++];
-      if (this.router?.sectionIndex === section) {
-        this.drawRouter(ctx, { x, y, width: sectionWidth, height: sectionHeight }, this.router);
+      if (this.sectionShowsRouter(section)) {
+        this.drawRouter(ctx, { x, y, width: sectionWidth, height: sectionHeight }, section);
         continue;
       }
-      const terminalSection = source?.kind === 'terminal' ? this.terminals.get(source.terminalId) : undefined;
       ctx.fillStyle = '#040a0f';
       ctx.fillRect(x, y, sectionWidth, sectionHeight);
-      ctx.strokeStyle = terminalSection ? '#305b37' : '#183541';
+      ctx.strokeStyle = '#183541';
       ctx.lineWidth = 2;
       ctx.strokeRect(x + 1, y + 1, sectionWidth - 2, sectionHeight - 2);
 
-      if (terminalSection) {
-        if (terminalSection.image.complete && terminalSection.image.naturalWidth) {
-          const inset = Math.max(3, outer * .45);
-          this.drawImageContained(ctx, terminalSection.image, {
-            x: x + inset,
-            y: y + inset,
-            width: sectionWidth - inset * 2,
-            height: sectionHeight - inset * 2,
-          });
-        } else {
-          ctx.fillStyle = '#a7d79a';
-          ctx.font = `500 ${Math.max(14, Math.round(header * .45))}px "Cascadia Mono", Consolas, monospace`;
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-          ctx.fillText(`LOADING ${terminalSection.terminal.label}`, x + sectionWidth / 2, y + sectionHeight / 2);
-        }
-        this.regions.push({
-          kind: 'terminal',
-          terminalId: terminalSection.terminal.id,
-          title: terminalSection.terminal.label,
-          x0: x,
-          y0: y,
-          x1: x + sectionWidth,
-          y1: y + sectionHeight,
-        });
+      if (source?.kind === 'tab') {
+        this.renderTabSection(ctx, section, source.tabId, { x, y, width: sectionWidth, height: sectionHeight }, header);
         continue;
       }
 
-      const view = paneId ? this.views.get(paneId) : undefined;
+      const view = source?.kind === 'pane' ? this.views.get(source.paneId) : undefined;
       if (!view) {
         ctx.fillStyle = '#536d77';
         ctx.font = `500 ${Math.max(14, Math.round(header * .45))}px "Cascadia Mono", Consolas, monospace`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText(source?.kind === 'pane' ? 'SOURCE UNAVAILABLE' : 'UNASSIGNED', x + sectionWidth / 2, y + sectionHeight / 2);
+        ctx.fillText('SOURCE UNAVAILABLE', x + sectionWidth / 2, y + sectionHeight / 2);
         if (source?.kind === 'pane') this.regions.push({
           kind: 'pane',
           paneId: source.paneId,
@@ -568,7 +574,7 @@ export class VideoWallController {
 
     // Keep the requested room-reset capability on the physical display, but
     // make it a small overlay inside the right section instead of a global UI.
-    if (this.router) {
+    if (this.openRouterIndex !== undefined) {
       this.resetRegion = undefined;
       texture.needsUpdate = true;
       return;
@@ -592,11 +598,63 @@ export class VideoWallController {
     texture.needsUpdate = true;
   }
 
+  /** Live `/ws/tab` composition blitted into an assigned section. */
+  private renderTabSection(
+    ctx: CanvasRenderingContext2D,
+    section: number,
+    tabId: string,
+    rect: { x: number; y: number; width: number; height: number },
+    header: number,
+  ): void {
+    const tabView = this.sectionTabs.get(section);
+    const label = this.tabs.find(candidate => candidate.tabId === tabId)?.name ?? tabId.slice(0, 8);
+    ctx.fillStyle = '#08151d';
+    ctx.fillRect(rect.x + 2, rect.y + 2, rect.width - 4, header);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.font = `600 ${Math.max(12, Math.round(header * .46))}px "Cascadia Mono", Consolas, monospace`;
+    ctx.fillStyle = '#bfeaf5';
+    ctx.fillText(truncate(ctx, `TAB  ${label}`, rect.width - header * 1.8), rect.x + header * .35, rect.y + header * .54);
+    ctx.fillStyle = tabView?.stream.connected ? '#3ce49a' : '#6d8791';
+    ctx.beginPath();
+    ctx.arc(rect.x + rect.width - header * .48, rect.y + header * .54, Math.max(3, header * .09), 0, Math.PI * 2);
+    ctx.fill();
+
+    const content = {
+      x: rect.x + 4,
+      y: rect.y + header + 4,
+      width: rect.width - 8,
+      height: rect.height - header - 8,
+    };
+    if (tabView?.stream.connected) {
+      if (tabView.dirty) {
+        tabView.stream.paint();
+        tabView.dirty = false;
+      }
+      this.drawWebPane(ctx, tabView.canvas, content);
+    } else {
+      ctx.fillStyle = '#070a0f';
+      ctx.fillRect(content.x, content.y, content.width, content.height);
+      ctx.fillStyle = '#4e91a9';
+      ctx.font = `500 ${Math.max(14, Math.round(header * .42))}px "Cascadia Mono", Consolas, monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('CONNECTING TAB', content.x + content.width / 2, content.y + content.height / 2);
+    }
+    this.regions.push({ kind: 'tab', tabId, title: label, x0: rect.x, y0: rect.y, x1: rect.x + rect.width, y1: rect.y + rect.height });
+  }
+
+  /**
+   * On-surface source picker. Painted permanently on a disconnected section
+   * and on demand when the operator reopens it on an assigned one. Tab rows
+   * assign the whole tab; the chevron affordance expands to individual panes.
+   */
   private drawRouter(
     ctx: CanvasRenderingContext2D,
     rect: { x: number; y: number; width: number; height: number },
-    router: RouterState,
+    sectionIndex: number,
   ): void {
+    const router = this.routerStateFor(sectionIndex);
     const scale = rect.height / 900;
     const pad = Math.max(16, 28 * scale);
     const titleHeight = Math.max(72, 92 * scale);
@@ -608,12 +666,11 @@ export class VideoWallController {
     const listHeight = listBottom - listTop;
     const visibleRows = Math.max(3, Math.floor((listHeight + rowGap) / (rowHeight + rowGap)));
     const listWidth = rect.width - pad * 2 - railWidth - pad * .45;
-    const active = this.sectionSources[router.sectionIndex];
+    const active = this.sectionSources[sectionIndex];
     const rows: Array<
-      | { kind: 'terminal'; terminal: TerminalDefinition }
       | { kind: 'tab'; tab: VideoWallTabGroup }
       | { kind: 'pane'; pane: VideoWallPane }
-    > = [...this.terminals.values()].map(entry => ({ kind: 'terminal' as const, terminal: entry.terminal }));
+    > = [];
     for (const tab of this.tabs) {
       const visiblePanes = tab.panes.filter(pane => !isSelfPane(pane));
       if (!visiblePanes.length) continue;
@@ -635,54 +692,68 @@ export class VideoWallController {
     ctx.textBaseline = 'middle';
     ctx.fillStyle = '#5f98b3';
     ctx.font = `500 ${Math.max(17, Math.round(27 * scale))}px "Cascadia Mono", Consolas, monospace`;
-    ctx.fillText(`PANE PICKER · SECTION ${router.sectionIndex + 1}`, rect.x + pad, rect.y + titleHeight * .35);
+    ctx.fillText(`SOURCE PICKER · SECTION ${sectionIndex + 1}`, rect.x + pad, rect.y + titleHeight * .35);
     ctx.fillStyle = '#bcefff';
     ctx.font = `700 ${Math.max(15, Math.round(22 * scale))}px "Cascadia Mono", Consolas, monospace`;
-    const sourceLabel = active?.kind === 'terminal'
-      ? this.terminals.get(active.terminalId)?.terminal.label ?? active.terminalId
+    const sourceLabel = active?.kind === 'tab'
+      ? this.tabs.find(tab => tab.tabId === active.tabId)?.name ?? active.tabId.slice(0, 8)
       : active?.kind === 'pane'
         ? paneLabel(this.availablePanes.find(pane => pane.paneId === active.paneId) ?? { paneId: active.paneId, title: '' })
-        : 'UNASSIGNED';
+        : 'DISCONNECTED';
     ctx.fillText(truncate(ctx, `CURRENT  ${sourceLabel}`, rect.width - pad * 3 - railWidth), rect.x + pad, rect.y + titleHeight * .72);
 
-    const closeSize = Math.max(44, 55 * scale);
-    const closeX = rect.x + rect.width - pad - closeSize;
-    const closeY = rect.y + pad * .55;
-    ctx.fillStyle = '#092631';
-    ctx.fillRect(closeX, closeY, closeSize, closeSize);
-    ctx.strokeStyle = '#42c8ff';
-    ctx.strokeRect(closeX, closeY, closeSize, closeSize);
-    ctx.fillStyle = '#d7f8ff';
-    ctx.textAlign = 'center';
-    ctx.font = `700 ${Math.max(20, Math.round(27 * scale))}px "Cascadia Mono", Consolas, monospace`;
-    ctx.fillText('×', closeX + closeSize / 2, closeY + closeSize / 2);
-    this.regions.push({ kind: 'router-close', sectionIndex: router.sectionIndex, x0: closeX, y0: closeY, x1: closeX + closeSize, y1: closeY + closeSize });
+    // A disconnected section has nothing to close back to — the picker IS its
+    // idle state. The dismiss affordance exists only for reopened pickers.
+    if (this.openRouterIndex === sectionIndex) {
+      const closeSize = Math.max(44, 55 * scale);
+      const closeX = rect.x + rect.width - pad - closeSize;
+      const closeY = rect.y + pad * .55;
+      ctx.fillStyle = '#092631';
+      ctx.fillRect(closeX, closeY, closeSize, closeSize);
+      ctx.strokeStyle = '#42c8ff';
+      ctx.strokeRect(closeX, closeY, closeSize, closeSize);
+      ctx.fillStyle = '#d7f8ff';
+      ctx.textAlign = 'center';
+      ctx.font = `700 ${Math.max(20, Math.round(27 * scale))}px "Cascadia Mono", Consolas, monospace`;
+      ctx.fillText('×', closeX + closeSize / 2, closeY + closeSize / 2);
+      this.regions.push({ kind: 'router-close', sectionIndex, x0: closeX, y0: closeY, x1: closeX + closeSize, y1: closeY + closeSize });
+    }
+
+    if (!rows.length) {
+      ctx.fillStyle = '#4e91a9';
+      ctx.textAlign = 'center';
+      ctx.font = `500 ${Math.max(15, Math.round(22 * scale))}px "Cascadia Mono", Consolas, monospace`;
+      ctx.fillText('WAITING FOR HYPERIA SOURCES', rect.x + rect.width / 2, listTop + listHeight / 2);
+      return;
+    }
 
     let y = listTop;
     for (const row of rows.slice(router.scroll, router.scroll + visibleRows)) {
       const x = rect.x + pad;
-      if (row.kind === 'terminal') {
-        const selected = active?.kind === 'terminal' && active.terminalId === row.terminal.id;
-        ctx.fillStyle = selected ? '#123523' : '#071720';
-        ctx.fillRect(x, y, listWidth, rowHeight);
-        ctx.strokeStyle = selected ? '#79dc55' : '#24502e';
-        ctx.strokeRect(x, y, listWidth, rowHeight);
-        ctx.fillStyle = selected ? '#d9ffcb' : '#a7d79a';
-        ctx.textAlign = 'left';
-        ctx.font = `500 ${Math.max(15, Math.round(21 * scale))}px "Cascadia Mono", Consolas, monospace`;
-        ctx.fillText(truncate(ctx, `TERMINAL  ${row.terminal.label}`, listWidth - pad), x + pad * .55, y + rowHeight / 2);
-        this.regions.push({ kind: 'router-terminal', sectionIndex: router.sectionIndex, terminalId: row.terminal.id, x0: x, y0: y, x1: x + listWidth, y1: y + rowHeight });
-      } else if (row.kind === 'tab') {
+      if (row.kind === 'tab') {
+        const selected = active?.kind === 'tab' && active.tabId === row.tab.tabId;
         const expanded = router.expandedTabId === row.tab.tabId;
-        ctx.fillStyle = expanded ? '#0b4253' : '#071720';
-        ctx.fillRect(x, y, listWidth, rowHeight);
-        ctx.strokeStyle = expanded ? '#42dcff' : '#17475b';
-        ctx.strokeRect(x, y, listWidth, rowHeight);
-        ctx.fillStyle = '#bcefff';
+        const chevronWidth = Math.max(44, rowHeight * .9);
+        const bodyWidth = listWidth - chevronWidth - rowGap;
+        ctx.fillStyle = selected ? '#0b4253' : '#071720';
+        ctx.fillRect(x, y, bodyWidth, rowHeight);
+        ctx.strokeStyle = selected ? '#42dcff' : '#17475b';
+        ctx.strokeRect(x, y, bodyWidth, rowHeight);
+        ctx.fillStyle = selected ? '#e6fbff' : '#bcefff';
         ctx.textAlign = 'left';
         ctx.font = `500 ${Math.max(15, Math.round(21 * scale))}px "Cascadia Mono", Consolas, monospace`;
-        ctx.fillText(truncate(ctx, row.tab.name, listWidth - pad), x + pad * .55, y + rowHeight / 2);
-        this.regions.push({ kind: 'router-tab', sectionIndex: router.sectionIndex, tabId: row.tab.tabId, x0: x, y0: y, x1: x + listWidth, y1: y + rowHeight });
+        ctx.fillText(truncate(ctx, `TAB  ${row.tab.name}`, bodyWidth - pad), x + pad * .55, y + rowHeight / 2);
+        this.regions.push({ kind: 'router-tab', sectionIndex, tabId: row.tab.tabId, x0: x, y0: y, x1: x + bodyWidth, y1: y + rowHeight });
+        const chevronX = x + bodyWidth + rowGap;
+        ctx.fillStyle = expanded ? '#0b4253' : '#08202a';
+        ctx.fillRect(chevronX, y, chevronWidth, rowHeight);
+        ctx.strokeStyle = expanded ? '#42dcff' : '#2c6d85';
+        ctx.strokeRect(chevronX, y, chevronWidth, rowHeight);
+        ctx.fillStyle = expanded ? '#e6fbff' : '#8eeaff';
+        ctx.textAlign = 'center';
+        ctx.font = `700 ${Math.max(15, Math.round(21 * scale))}px "Cascadia Mono", Consolas, monospace`;
+        ctx.fillText(expanded ? '▾' : '▸', chevronX + chevronWidth / 2, y + rowHeight / 2);
+        this.regions.push({ kind: 'router-tab-expand', sectionIndex, tabId: row.tab.tabId, x0: chevronX, y0: y, x1: chevronX + chevronWidth, y1: y + rowHeight });
       } else {
         const selected = active?.kind === 'pane' && active.paneId === row.pane.paneId;
         const indent = pad * .8;
@@ -695,7 +766,7 @@ export class VideoWallController {
         ctx.font = `500 ${Math.max(14, Math.round(19 * scale))}px "Cascadia Mono", Consolas, monospace`;
         const kind = row.pane.shell === 'web' ? 'WEB' : 'PTY';
         ctx.fillText(truncate(ctx, `${kind}  ${paneLabel(row.pane)}`, listWidth - indent - pad), x + indent + pad * .55, y + rowHeight / 2);
-        this.regions.push({ kind: 'router-pane', sectionIndex: router.sectionIndex, paneId: row.pane.paneId, x0: x + indent, y0: y, x1: x + listWidth, y1: y + rowHeight });
+        this.regions.push({ kind: 'router-pane', sectionIndex, paneId: row.pane.paneId, x0: x + indent, y0: y, x1: x + listWidth, y1: y + rowHeight });
       }
       y += rowHeight + rowGap;
     }
@@ -715,7 +786,7 @@ export class VideoWallController {
       ctx.textAlign = 'center';
       ctx.font = `700 ${Math.max(20, Math.round(29 * scale))}px "Cascadia Mono", Consolas, monospace`;
       ctx.fillText(glyph, railX + railWidth / 2, buttonY + buttonHeight / 2);
-      this.regions.push({ kind, sectionIndex: router.sectionIndex, x0: railX, y0: buttonY, x1: railX + railWidth, y1: buttonY + buttonHeight });
+      this.regions.push({ kind, sectionIndex, x0: railX, y0: buttonY, x1: railX + railWidth, y1: buttonY + buttonHeight });
     }
     const trackY = listTop + buttonHeight + rowGap;
     const trackHeight = Math.max(20, downY - rowGap - trackY);
@@ -737,41 +808,22 @@ export class VideoWallController {
     return {
       outer,
       gap,
-      sectionWidth: (canvas.width - outer * 2 - gap * 3) / 4,
+      sectionWidth: (canvas.width - outer * 2 - gap * (WALL_SECTION_COUNT - 1)) / WALL_SECTION_COUNT,
       sectionHeight: canvas.height - outer * 2,
     };
   }
 
-  private restoreSectionSources(): Array<SectionSource | undefined> {
-    const sources: Array<SectionSource | undefined> = [undefined, undefined, undefined, undefined];
+  private restoreSectionSources(): SectionSource[] {
     try {
-      const parsed = JSON.parse(localStorage.getItem(VideoWallController.sectionStorageKey) ?? 'null') as unknown;
-      if (!Array.isArray(parsed)) return sources;
-      for (let index = 0; index < 4; index++) {
-        const source = parsed[index] as Partial<SectionSource> | undefined;
-        if (source?.kind === 'terminal' && typeof source.terminalId === 'string') sources[index] = { kind: 'terminal', terminalId: source.terminalId };
-        else if (source?.kind === 'pane' && typeof source.paneId === 'string') sources[index] = { kind: 'pane', paneId: source.paneId };
-      }
+      return normalizeSectionSources(JSON.parse(localStorage.getItem(VideoWallController.sectionStorageKey) ?? 'null'));
     } catch { /* Ignore malformed legacy browser state. */ }
-    return sources;
+    return normalizeSectionSources(null);
   }
 
   private persistSectionSources(): void {
     localStorage.setItem(VideoWallController.sectionStorageKey, JSON.stringify(this.sectionSources));
   }
 
-  private drawImageContained(
-    ctx: CanvasRenderingContext2D,
-    source: HTMLImageElement,
-    rect: { x: number; y: number; width: number; height: number },
-  ): void {
-    ctx.fillStyle = '#010407';
-    ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
-    const scale = Math.min(rect.width / source.naturalWidth, rect.height / source.naturalHeight);
-    const width = source.naturalWidth * scale;
-    const height = source.naturalHeight * scale;
-    ctx.drawImage(source, rect.x + (rect.width - width) / 2, rect.y + (rect.height - height) / 2, width, height);
-  }
 
   private drawWebPane(
     ctx: CanvasRenderingContext2D,
